@@ -7,8 +7,10 @@ The first milestone is to measure candidate Tokyo routes from the target mainlan
 ## Project workflow
 
 - GitHub Issues hold research, decisions, experiments, and implementation work.
-- `CONTEXT.md` will hold the project's agreed domain vocabulary once terms are resolved.
-- `docs/adr/` will hold architectural decisions that are costly to reverse.
+- [`CONTEXT.md`](CONTEXT.md) defines the project's agreed domain vocabulary.
+- [`docs/adr/`](docs/adr/) records architectural decisions that are costly to reverse.
+- [`docs/benchmark-protocol.md`](docs/benchmark-protocol.md) defines the route and tunnel test method.
+- [`docs/research/tokyo-vps-candidates.md`](docs/research/tokyo-vps-candidates.md) tracks current providers and first-party test endpoints.
 - Public files must never contain server credentials, client UUIDs, private keys, subscription secrets, or administrative endpoints.
 
-The project is currently in discovery. Deployment instructions and compatibility guarantees have not been established.
+The project is currently in discovery. Follow the [proof-of-concept parent issue](https://github.com/bagtyyarkovusov/vpn-gcore/issues/1) for progress. Deployment instructions and compatibility guarantees have not been established.
