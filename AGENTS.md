@@ -8,6 +8,11 @@ Issues and specs live in GitHub Issues for `bagtyyarkovusov/vpn-gcore`. See `doc
 
 Use the five default triage labels. See `docs/agents/triage-labels.md`.
 
+### Infrastructure safety
+
+Never delete or modify cloud resources this project did not create. See
+`docs/agents/infrastructure-safety.md`.
+
 ### Domain docs
 
 Use the single-context layout with `CONTEXT.md` and `docs/adr/` at the repository root. See `docs/agents/domain.md`.
