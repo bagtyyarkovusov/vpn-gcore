@@ -10,10 +10,14 @@ proof_slug() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
 }
 
+# proof_json_update FILE SCRIPT [ARG...] — rewrite FILE only when the update
+# actually succeeded. A half-written or empty temp file must never replace
+# recorded lifecycle state: losing state.json mid-run strands a live Droplet,
+# because every later guard reads it and fails closed.
 proof_json_update() {
   local file="$1" script="$2" tmp
   tmp=$(mktemp)
-  python3 - "$file" "$script" "${@:3}" >"$tmp" <<'PY'
+  if ! python3 - "$file" "$script" "${@:3}" >"$tmp" <<'PY'
 import json
 import sys
 
@@ -29,18 +33,32 @@ exec(script, {"__builtins__": {"__import__": __import__, "int": int, "str": str,
 json.dump(data, sys.stdout, indent=2, sort_keys=True)
 sys.stdout.write("\n")
 PY
+  then
+    rm -f "$tmp"
+    proof_warn "state update failed for $file; the previous file is left intact"
+    return 1
+  fi
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    proof_warn "state update produced no output for $file; the previous file is left intact"
+    return 1
+  fi
   mv "$tmp" "$file"
 }
 
+# proof_init_state RUN_DIR REGION SIZE IMAGE BUDGET_USD DAYS [XRAY_VERSION] [PRICE_HOURLY_USD]
+# PRICE_HOURLY_USD is the provider's own quoted hourly price. Recording it lets
+# the budget guard bound a size the built-in price table has never heard of.
 proof_init_state() {
-  local run_dir="$1" region="$2" size="$3" image="$4" max_budget_usd="$5" max_lifecycle_days="$6" xray_version="${7:-}"
+  local run_dir="$1" region="$2" size="$3" image="$4" max_budget_usd="$5" max_lifecycle_days="$6" xray_version="${7:-}" price_hourly="${8:-}"
   mkdir -p "$run_dir"
-  python3 - "$run_dir/state.json" "$region" "$size" "$image" "$max_budget_usd" "$max_lifecycle_days" "$xray_version" <<'PY'
+  PROOF_TAG="$PROOF_TAG" python3 - "$run_dir/state.json" "$region" "$size" "$image" "$max_budget_usd" "$max_lifecycle_days" "$xray_version" "$price_hourly" <<'PY'
 import datetime as dt
 import json
+import os
 import sys
 
-path, region, size, image, max_budget, max_days, xray_version = sys.argv[1:]
+path, region, size, image, max_budget, max_days, xray_version, price_hourly = sys.argv[1:]
 created = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 data = {
     "schema_version": 1,
@@ -52,11 +70,13 @@ data = {
     "image": image,
     "max_budget_usd": int(max_budget),
     "max_lifecycle_days": int(max_days),
-    "ownership_tag": "vpn-gcore-experiment",
+    "ownership_tag": os.environ["PROOF_TAG"],
     "outcomes": {},
 }
 if xray_version:
     data["xray_version"] = xray_version
+if price_hourly:
+    data["price_hourly_usd"] = float(price_hourly)
 with open(path, "w", encoding="utf-8") as fh:
     json.dump(data, fh, indent=2, sort_keys=True)
     fh.write("\n")
@@ -117,7 +137,7 @@ proof_forget_env_keys() {
   local tmp
   tmp=$(mktemp)
   if [[ -f "$env_file" ]]; then
-    python3 - "$env_file" "$@" >"$tmp" <<'PY'
+    if ! python3 - "$env_file" "$@" >"$tmp" <<'PY'
 import sys
 
 env_file = sys.argv[1]
@@ -128,6 +148,11 @@ with open(env_file, encoding="utf-8") as fh:
         if key not in keys:
             sys.stdout.write(line)
 PY
+    then
+      rm -f "$tmp"
+      proof_warn "env cleanup failed for $env_file; the previous file is left intact"
+      return 1
+    fi
     mv "$tmp" "$env_file"
     chmod 600 "$env_file"
   else
@@ -303,15 +328,23 @@ max_days = int(state.get("max_lifecycle_days", 0))
 max_budget = int(state.get("max_budget_usd", 0))
 size = state.get("size", "unknown")
 
+# Fallback only. The wizard records the provider's own quoted price in state, so
+# this table is what keeps an older state file bounded, not the primary source.
 hourly_prices = {
     "s-1vcpu-1gb": 0.00893,
     "s-1vcpu-2gb": 0.01786,
     "s-2vcpu-2gb": 0.02679,
 }
-price_hourly = hourly_prices.get(size)
+price_hourly = state.get("price_hourly_usd", hourly_prices.get(size))
 
 if not created_raw or max_days <= 0 or max_budget <= 0:
     print("lifecycle bounds are missing from state; stop before mutation", file=sys.stderr)
+    sys.exit(1)
+
+# An unpriceable size cannot be held to a budget. Refuse rather than run on
+# unbounded spend.
+if price_hourly is None:
+    print(f"no hourly price recorded for size {size}; cannot enforce the USD {max_budget} budget", file=sys.stderr)
     sys.exit(1)
 
 created = dt.datetime.fromisoformat(created_raw)
@@ -321,7 +354,7 @@ if age_hours > max_days * 24:
     print(f"proof lifecycle is older than {max_days} days; destroy only, then start over", file=sys.stderr)
     sys.exit(1)
 
-if price_hourly is not None and age_hours * price_hourly > max_budget:
+if age_hours * price_hourly > max_budget:
     print(f"estimated proof cost exceeds USD {max_budget}; destroy only, then start over", file=sys.stderr)
     sys.exit(1)
 PY
@@ -374,6 +407,7 @@ manifest = {
         "max_lifecycle_days",
         "ownership_tag",
         "xray_version",
+        "price_hourly_usd",
         "outcomes",
     )
     if key in state
@@ -391,12 +425,22 @@ manifest["versions"] = {
 
 encoded = json.dumps(manifest, indent=2, sort_keys=True)
 encoded = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<redacted-ipv4>", encoded)
+# The proof node is created with IPv6 on, so address redaction cannot be v4
+# only. Requiring three or more colon-separated groups keeps ISO timestamps
+# (12:34:56 has two) out of the match.
+encoded = re.sub(r"\b[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{0,4}){3,7}\b", "<redacted-ipv6>", encoded)
 with open(os.path.join(run_dir, "manifest.json"), "w", encoding="utf-8") as fh:
     fh.write(encoded)
     fh.write("\n")
 PY
 }
 
+# proof_require_mutation_authorized ACTION — the last gate before a cloud write.
+# Returns 2 on a dry run, 1 when unauthorized, 0 when allowed.
+#
+# PROOF_CLOUD_AUTHORIZED must be derived from a human answering a prompt for
+# this specific action. A caller that hardcodes it to 1 turns this into a no-op;
+# see the wizard's authorize() for the intended pattern.
 proof_require_mutation_authorized() {
   local action="$1"
   if [[ "${PROOF_DRY_RUN:-0}" == 1 ]]; then

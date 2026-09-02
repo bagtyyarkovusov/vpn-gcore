@@ -38,3 +38,10 @@ Baselines contain live public addresses and account identifiers, so they stay in
 private mode-600 files outside this repository and are never committed, pasted
 into an issue, or published. This document records the rule; it does not record
 the resources.
+
+The code that enforces the rule is a different matter. `scripts/do-guard.sh`
+holds the decision logic — what counts as protected, what payload gets the
+experiment tag, and the only sanctioned destroy path — and is committed,
+reviewed, and tested. Safety-critical logic that nobody can review is not a
+safeguard. It reads the private baseline from `DO_PROTECTED_IDS`; with no
+baseline present, every Droplet is treated as protected.

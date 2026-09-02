@@ -61,6 +61,7 @@ say()  { printf '  %s\n' "$1"; }
 step() { printf '  %s•%s %s\n' "$BLUE" "$RESET" "$1"; }
 note() { printf '  %s%s%s\n' "$DIM" "$1" "$RESET"; }
 warn() { printf '  %s⚠ %s%s\n' "$YELLOW" "$1" "$RESET"; }
+err()  { printf '  %s✗ %s%s\n' "$RED" "$1" "$RESET"; }
 
 # open_url URL — open in the human's browser, cross-platform incl. WSL.
 open_url() {
@@ -129,6 +130,14 @@ ask_secret() {
 # any existing line). Idempotent.
 write_env() {
   local key="$1" value="$2" tmp
+  # ENV_FILE is later re-read with `set -a; . "$ENV_FILE"`, so a value with a
+  # space or a metacharacter would execute as a command in a shell that is
+  # holding a live API token. Every legitimate value here is a slug, an id, an
+  # address, or a path.
+  if [[ -z "$value" || "$value" =~ [^A-Za-z0-9_.:@/-] ]]; then
+    warn "refusing to store an unsafe value for $key"
+    exit 1
+  fi
   touch "$ENV_FILE"
   tmp=$(mktemp)
   grep -vE "^${key}=" "$ENV_FILE" > "$tmp" || true
@@ -189,19 +198,23 @@ TOTAL_STAGES=8
 # identifier, so it never touches the repository. Private, mode 600, outside.
 ENV_FILE="/private/tmp/vpn-gcore-do-run.env"
 TOKEN_FILE="/private/tmp/vpn-gcore-do-session.env"
-GUARD="/private/tmp/vpn-gcore-do-guard.sh"
 SSH_KEY="/private/tmp/vpn-gcore-do-experiment-key"
 EXISTING_RUN_DIR=$(grep -E '^DO_RUN_DIR=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)
 RUN_DIR="${DO_RUN_DIR:-${EXISTING_RUN_DIR:-/private/tmp/vpn-gcore-do-stage2-$(date +%Y%m%d-%H%M%S)}}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GUARD="$REPO_ROOT/scripts/do-guard.sh"
+PROTECTED_IDS_FILE="${DO_PROTECTED_IDS:-/private/tmp/vpn-gcore-do-discovery/protected-ids.txt}"
 API="https://api.digitalocean.com/v2"
-TAG="vpn-gcore-experiment"
 MAX_PROOF_BUDGET_USD=5
 MAX_PROOF_LIFECYCLE_DAYS=7
 XRAY_VERSION="v26.6.1"
 
 # shellcheck source=scripts/proof-lifecycle.sh
 . "$REPO_ROOT/scripts/proof-lifecycle.sh"
+
+# One literal for the ownership tag. The guard, the create payload, the recorded
+# state, and every destroy check all read it from here.
+TAG="$PROOF_TAG"
 
 umask 077
 mkdir -p "$RUN_DIR"
@@ -236,6 +249,39 @@ run_measurement() {
   fi
 }
 
+# A Droplet bills from the moment it exists, and this script has many ways to
+# stop early — a declined prompt, a failed guard, an unexpected non-zero under
+# `set -e`. Whatever the exit path, the operator leaves with the exact command
+# that gives the slot back.
+PROOF_LIVE_DROPLET_ID=""
+proof_exit_reminder() {
+  local status=$?
+  if [[ -n "$PROOF_LIVE_DROPLET_ID" ]]; then
+    printf '\n'
+    err "Droplet $PROOF_LIVE_DROPLET_ID still exists and is STILL BILLING."
+    err "Destroy it before you stop for the day:"
+    note "  cd $REPO_ROOT"
+    note "  set -a; . $TOKEN_FILE; set +a; . $GUARD; do_destroy_droplet $PROOF_LIVE_DROPLET_ID"
+  fi
+  return "$status"
+}
+trap proof_exit_reminder EXIT
+
+# authorize ACTION PROMPT — ask the human, and let their answer be the only
+# thing that sets the cloud-mutation flag. Never hardcode PROOF_CLOUD_AUTHORIZED
+# at a call site: that would make the gate decorative.
+authorize() {
+  local action="$1" prompt="$2" granted=0
+  if [[ "${PROOF_DRY_RUN:-0}" == 1 ]]; then
+    proof_require_mutation_authorized "$action"
+    return
+  fi
+  if confirm "$prompt"; then
+    granted=1
+  fi
+  PROOF_CLOUD_AUTHORIZED="$granted" proof_require_mutation_authorized "$action"
+}
+
 banner "DigitalOcean exit-node route test — create, measure, destroy"
 
 # ── Stage 1 ───────────────────────────────────────────────────────────────
@@ -250,9 +296,19 @@ done
 command -v iperf3 >/dev/null 2>&1 || note "iperf3 not installed locally — bidirectional test will be skipped"
 
 [[ -r "$TOKEN_FILE" ]] || { warn "no token file at $TOKEN_FILE"; exit 1; }
-set -a; . "$TOKEN_FILE"; set +a
+set -a
+# shellcheck source=/dev/null  # private, mode-600, outside the repository
+. "$TOKEN_FILE"
+set +a
 [[ -r "$GUARD" ]] || { warn "no safety guard at $GUARD — refusing to continue"; exit 1; }
-# shellcheck source=/dev/null
+[[ -s "$PROTECTED_IDS_FILE" ]] || {
+  warn "no protected baseline at $PROTECTED_IDS_FILE — refusing to continue"
+  warn "Capture the baseline before any write call. See docs/agents/infrastructure-safety.md."
+  exit 1
+}
+DO_PROTECTED_IDS="$PROTECTED_IDS_FILE"
+DO_EXPERIMENT_TAG="$TAG"
+# shellcheck source=scripts/do-guard.sh
 . "$GUARD"
 
 PROTECTED_IDS="$(do_protected_ids)" || exit 1
@@ -277,6 +333,7 @@ if [[ -n "$EXISTING_DROPLET_ID" ]]; then
   if [[ -f "$RUN_DIR/state.json" ]] \
      && proof_recovery_plan "$RUN_DIR/state.json" "$RUN_DIR/protected-ids.txt" "$RUN_DIR/recovery-droplet.json"; then
     warn "Stop here and finish the exact recorded lifecycle before creating another proof node."
+    note "  cd $REPO_ROOT"
     note "  set -a; . $TOKEN_FILE; set +a; . $GUARD; do_destroy_droplet $EXISTING_DROPLET_ID"
   else
     warn "Recovery did not verify exact ownership. Reconcile manually before any mutation."
@@ -332,9 +389,12 @@ step "s-1vcpu-2gb  1 vCPU / 2 GB / 2 TB   \$12/mo  \$0.01786/hr"
 step "s-1vcpu-1gb  1 vCPU / 1 GB / 1 TB    \$6/mo  \$0.00893/hr"
 note "Type the slug, not the line number."
 printf '\n'
+DO_PRICE_HOURLY=""
 for _attempt in 1 2 3; do
   ask DO_SIZE "Plan slug [s-2vcpu-2gb]:"; DO_SIZE="${DO_SIZE:-s-2vcpu-2gb}"
-  api GET "/sizes?per_page=500" | jqp '
+  # The provider's own hourly price, not a local table, is what the budget guard
+  # holds this lifecycle to.
+  DO_PRICE_HOURLY=$(api GET "/sizes?per_page=500" | jqp '
 sizes = json.load(sys.stdin)["sizes"]
 slug, region = sys.argv[1], sys.argv[2]
 for s in sizes:
@@ -344,18 +404,31 @@ for s in sizes:
         sys.stderr.write("that plan is not currently available\n"); sys.exit(1)
     if region not in s["regions"]:
         sys.stderr.write("that plan is not offered in %s\n" % region); sys.exit(1)
-    print("%s: USD %s/mo, USD %.5f/hr" % (slug, s["price_monthly"], s["price_hourly"]))
+    sys.stderr.write("%s: USD %s/mo, USD %.5f/hr\n" % (slug, s["price_monthly"], s["price_hourly"]))
+    print("%.5f" % s["price_hourly"])
     sys.exit(0)
 sys.stderr.write("no such plan slug\n"); sys.exit(1)
-' "$DO_SIZE" "$DO_REGION" && break
+' "$DO_SIZE" "$DO_REGION") && break
   warn "\"$DO_SIZE\" is not a usable plan slug in $DO_REGION. Type the slug, e.g. s-2vcpu-2gb."
   [[ "$_attempt" == 3 ]] && { warn "no valid plan after 3 attempts — stopping"; exit 1; }
 done
-ask DO_IMAGE "Image [ubuntu-24-04-x64]:"; DO_IMAGE="${DO_IMAGE:-ubuntu-24-04-x64}"
+
+# Region and plan are validated above because a bad slug is only rejected at
+# create time. The image slug has exactly the same failure mode.
+for _attempt in 1 2 3; do
+  ask DO_IMAGE "Image [ubuntu-24-04-x64]:"; DO_IMAGE="${DO_IMAGE:-ubuntu-24-04-x64}"
+  api GET "/images?type=distribution&per_page=500" | jqp '
+images = json.load(sys.stdin)["images"]
+slug, region = sys.argv[1], sys.argv[2]
+sys.exit(0 if any(i.get("slug") == slug and region in i.get("regions", []) for i in images) else 1)
+' "$DO_IMAGE" "$DO_REGION" && break
+  warn "\"$DO_IMAGE\" is not a distribution image available in $DO_REGION."
+  [[ "$_attempt" == 3 ]] && { warn "no valid image after 3 attempts — stopping"; exit 1; }
+done
 write_env DO_REGION "$DO_REGION"
 write_env DO_SIZE "$DO_SIZE"
 write_env DO_IMAGE "$DO_IMAGE"
-proof_init_state "$RUN_DIR" "$DO_REGION" "$DO_SIZE" "$DO_IMAGE" "$MAX_PROOF_BUDGET_USD" "$MAX_PROOF_LIFECYCLE_DAYS" "$XRAY_VERSION"
+proof_init_state "$RUN_DIR" "$DO_REGION" "$DO_SIZE" "$DO_IMAGE" "$MAX_PROOF_BUDGET_USD" "$MAX_PROOF_LIFECYCLE_DAYS" "$XRAY_VERSION" "$DO_PRICE_HOURLY"
 printf '\n'
 note "Billing is hourly. A 4-hour cycle on s-2vcpu-2gb costs about USD 0.11."
 note "This proof lifecycle is bounded to ${MAX_PROOF_LIFECYCLE_DAYS} days and USD ${MAX_PROOF_BUDGET_USD}."
@@ -375,6 +448,7 @@ fi
 chmod 600 "$SSH_KEY"
 PUBKEY="$(cat "${SSH_KEY}.pub")"
 FPR="$(ssh-keygen -lf "${SSH_KEY}.pub" | awk '{print $2}')"
+say "Key fingerprint: $FPR"
 
 KEY_ID=$(api GET "/account/keys?per_page=200" | jqp '
 keys = json.load(sys.stdin)["ssh_keys"]
@@ -387,9 +461,9 @@ if [[ -z "$KEY_ID" ]]; then
   api GET "/droplets?per_page=200" > "$RUN_DIR/pre-key-live-droplets.json"
   proof_verify_protected_baseline_json "$PROTECTED_IDS" "$RUN_DIR/pre-key-live-droplets.json" \
     || { warn "baseline changed before SSH-key upload — refusing mutation"; exit 1; }
-  confirm "Upload this experiment public SSH key to the DigitalOcean account?" \
+  authorize "upload experiment SSH key" \
+    "Upload this experiment public SSH key to the DigitalOcean account?" \
     || { warn "SSH-key upload not authorized; stopping before cloud mutation."; exit 1; }
-  PROOF_CLOUD_AUTHORIZED=1 proof_require_mutation_authorized "upload experiment SSH key" || exit 1
   KEY_ID=$(api POST /account/keys "$(python3 -c '
 import json,sys
 print(json.dumps({"name":"vpn-gcore-experiment","public_key":sys.argv[1]}))' "$PUBKEY")" \
@@ -419,11 +493,10 @@ step "xray    $XRAY_VERSION  VLESS + REALITY + XTLS Vision on TCP/443"
 step "extras  IPv6 on, monitoring on, backups off"
 printf '\n'
 warn "This consumes the account's last free Droplet slot and starts billing."
-confirm "Create it?" || { say "Nothing created."; exit 0; }
 api GET "/droplets?per_page=200" > "$RUN_DIR/pre-create-live-droplets.json"
 proof_verify_protected_baseline_json "$PROTECTED_IDS" "$RUN_DIR/pre-create-live-droplets.json" \
   || { warn "baseline changed before create — refusing mutation"; exit 1; }
-if ! PROOF_CLOUD_AUTHORIZED=1 proof_require_mutation_authorized "create Droplet $DROPLET_NAME in $DO_REGION"; then
+if ! authorize "create Droplet $DROPLET_NAME in $DO_REGION" "Create it?"; then
   say "Nothing created."
   exit 0
 fi
@@ -436,9 +509,23 @@ set -eux
 export DEBIAN_FRONTEND=noninteractive
 XRAY_VERSION="$XRAY_VERSION"
 apt-get update -y
-apt-get install -y ca-certificates curl iperf3 openssl
+apt-get install -y ca-certificates curl iperf3 openssl ufw
 bash -c "\$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "\$XRAY_VERSION"
 install -d -m 700 /root/vpn-gcore-proof
+
+# Deny by default. Only the three ports this proof actually needs are reachable,
+# and iperf3's is useless while its unit is stopped (see below).
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow 443/tcp
+ufw allow 5201/tcp
+ufw --force enable
+
+# The REALITY private key, the client UUID and the short id are generated here.
+# Tracing is off across this block so they never reach cloud-init-output.log.
+set +x
 VLESS_UUID="\$(cat /proc/sys/kernel/random/uuid)"
 KEYPAIR="\$(/usr/local/bin/xray x25519)"
 REALITY_PRIVATE_KEY="\$(printf '%s\n' "\$KEYPAIR" | awk '/Private key:/ {print \$3}')"
@@ -500,12 +587,17 @@ cat > /root/vpn-gcore-proof/shadowrocket-vless-reality.uri <<PROFILE
 vless://\$VLESS_UUID@\$PUBLIC_IPV4:443?encryption=none&security=reality&sni=\$SERVER_NAME&fp=chrome&pbk=\$REALITY_PUBLIC_KEY&sid=\$SHORT_ID&type=tcp&flow=xtls-rprx-vision#vpn-gcore-\$XRAY_VERSION-proof
 PROFILE
 chmod 600 /root/vpn-gcore-proof/shadowrocket-vless-reality.uri
+set -x
 /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json
 systemctl enable --now xray
 systemctl restart xray
-printf '[Unit]\nDescription=iperf3\n[Service]\nExecStart=/usr/bin/iperf3 -s\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/iperf3.service
+# Installed but NOT enabled. An unauthenticated iperf3 server open to the
+# internet for the whole lifecycle is a bandwidth-billing hole that the
+# compute-hours budget guard cannot see. Stage 6 starts it for the throughput
+# runs and stops it again.
+printf '[Unit]\nDescription=iperf3\n[Service]\nExecStart=/usr/bin/iperf3 -s\nRestart=always\n' > /etc/systemd/system/iperf3.service
 systemctl daemon-reload
-systemctl enable --now iperf3
+systemctl disable iperf3 || true
 touch /var/lib/vpn-gcore-ready
 CLOUDINIT
 )
@@ -523,6 +615,7 @@ if [[ -z "$DROPLET_ID" ]]; then
   warn "Check the dashboard for an orphan before re-running; the slot may be held."
   exit 1
 fi
+PROOF_LIVE_DROPLET_ID="$DROPLET_ID"   # from here on, every exit path reminds
 write_env DO_DROPLET_ID "$DROPLET_ID"
 proof_record_created "$RUN_DIR" "$DROPLET_ID" "$DROPLET_NAME" "$DO_REGION" "$DO_SIZE"
 say "Created Droplet id $DROPLET_ID. Waiting for an address and for boot…"
@@ -538,79 +631,94 @@ print(v4[0] if v4 and d["status"]=="active" else "")' <<<"$D")
   [[ -n "$DROPLET_IP" ]] && break
   sleep 10
 done
-[[ -n "$DROPLET_IP" ]] || { warn "Droplet never became active. Destroy it in Stage 8."; }
-write_env DO_DROPLET_IP "$DROPLET_IP"
-say "Address assigned. It is stored in $ENV_FILE and never printed to a public place."
-note "The bootstrap installs Xray $XRAY_VERSION and iperf3; give it about two minutes."
+NODE_REACHABLE=1
+if [[ -z "$DROPLET_IP" ]]; then
+  NODE_REACHABLE=0
+  warn "Droplet never became active. Skipping Stages 5 and 6; go straight to destroy."
+else
+  write_env DO_DROPLET_IP "$DROPLET_IP"
+  say "Address assigned. It is stored in $ENV_FILE and never printed to a public place."
+  note "The bootstrap installs Xray $XRAY_VERSION and iperf3; give it about two minutes."
+fi
 pause "Press Enter once you are ready to switch networks."
 
 # ── Stage 5 ───────────────────────────────────────────────────────────────
 stage "Turn the commercial VPN OFF"
-warn "Everything measured from here must run on the bare China Telecom path."
-warn "A measurement taken through the commercial VPN is a different experiment"
-warn "and must never be recorded as direct-route evidence."
-printf '\n'
-step "Quit Shadowrocket / any other VPN client completely."
-step "Confirm the laptop is tethered to the China Telecom 5G handset in Hangzhou."
-step "Pause downloads, cloud backups and OS updates. Keep the handset still."
-printf '\n'
-pause "Press Enter when the VPN is fully off."
-
-while true; do
+if [[ "$NODE_REACHABLE" -eq 0 ]]; then
+  warn "No address was ever assigned, so there is nothing to measure against."
+  MEASUREMENT_FAILED=1
+  { echo "vpn_state=not-measured"; echo "geolocation=not-measured"
+    echo "session_kind=aborted-before-measurement"; } > "$RUN_DIR/path-state.txt"
+else
+  warn "Everything measured from here must run on the bare China Telecom path."
+  warn "A measurement taken through the commercial VPN is a different experiment"
+  warn "and must never be recorded as direct-route evidence."
   printf '\n'
-  say "Checking the live path…"
-  FAKE_DNS=$(dig +short +time=3 +tries=1 example.com 2>/dev/null | grep -c '^198\.18\.' || true)
-  ORG=$(curl -4 -sS --max-time 10 https://ipinfo.io/org 2>/dev/null || echo unknown)
-  CITY=$(curl -4 -sS --max-time 10 https://ipinfo.io/city 2>/dev/null || echo unknown)
-  CC=$(curl -4 -sS --max-time 10 https://ipinfo.io/country 2>/dev/null || echo unknown)
-  if [[ -z "$CC" || "$CC" == unknown ]]; then   # ipinfo itself may be unreachable from CN
-    CC=$(curl -4 -sS --max-time 10 https://api.country.is 2>/dev/null \
-         | jqp 'print(json.load(sys.stdin).get("country","unknown"))' 2>/dev/null || echo unknown)
-    [[ "$CC" == unknown ]] || note "ipinfo.io unreachable; fell back to api.country.is"
-  fi
-  say "resolver  : $( [[ "$FAKE_DNS" -gt 0 ]] && echo 'FAKE-IP 198.18/15 — a tunnel is still capturing DNS' || echo 'clean' )"
-  say "public org: $ORG"
-  say "location  : $CITY / $CC"
+  step "Quit Shadowrocket / any other VPN client completely."
+  step "Confirm the laptop is tethered to the China Telecom 5G handset in Hangzhou."
+  step "Pause downloads, cloud backups and OS updates. Keep the handset still."
   printf '\n'
+  pause "Press Enter when the VPN is fully off."
 
-  if [[ "$FAKE_DNS" -gt 0 ]]; then
-    warn "A VPN or proxy is still intercepting DNS. Turn it fully off."
-  elif printf '%s' "$ORG$CC" | grep -Eqi 'gcore|g-core|akamai|linode|vultr|digitalocean|datacamp|m247|JP$'; then
-    warn "The visible exit looks like a datacenter or a Japan exit, not China Telecom."
-  elif [[ "$CC" == "CN" ]]; then
-    say "Path looks like the bare China Telecom access network."
-    { echo "vpn_state=off"; echo "public_org=$ORG"; echo "city=$CITY"; echo "country=$CC"
-      echo "geolocation=verified"
-      echo "local_time_cst=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z %z')"; } > "$RUN_DIR/path-state.txt"
-    break
-  else
-    warn "Country reads '$CC', expected CN."
-    note "Both geolocation services being unreachable is itself plausible on bare"
-    note "China Telecom and is not by itself evidence that a VPN is still up."
-  fi
+  while true; do
+    printf '\n'
+    say "Checking the live path…"
+    FAKE_DNS=$(dig +short +time=3 +tries=1 example.com 2>/dev/null | grep -c '^198\.18\.' || true)
+    ORG=$(curl -4 -sS --max-time 10 https://ipinfo.io/org 2>/dev/null || echo unknown)
+    CITY=$(curl -4 -sS --max-time 10 https://ipinfo.io/city 2>/dev/null || echo unknown)
+    CC=$(curl -4 -sS --max-time 10 https://ipinfo.io/country 2>/dev/null || echo unknown)
+    if [[ -z "$CC" || "$CC" == unknown ]]; then   # ipinfo itself may be unreachable from CN
+      CC=$(curl -4 -sS --max-time 10 https://api.country.is 2>/dev/null \
+           | jqp 'print(json.load(sys.stdin).get("country","unknown"))' 2>/dev/null || echo unknown)
+      [[ "$CC" == unknown ]] || note "ipinfo.io unreachable; fell back to api.country.is"
+    fi
+    say "resolver  : $( [[ "$FAKE_DNS" -gt 0 ]] && echo 'FAKE-IP 198.18/15 — a tunnel is still capturing DNS' || echo 'clean' )"
+    say "public org: $ORG"
+    say "location  : $CITY / $CC"
+    printf '\n'
 
-  # A clean resolver is the load-bearing check; geolocation is corroboration and
-  # may simply be blocked. Allow the operator to vouch, but record that they did.
-  printf '\n'
-  if [[ "$FAKE_DNS" -eq 0 ]] \
-     && confirm "Override: VPN is off and this is China Telecom 5G in Hangzhou. Proceed?"; then
-    { echo "vpn_state=off-operator-confirmed"; echo "public_org=$ORG"; echo "city=$CITY"; echo "country=$CC"
-      echo "geolocation=unverified"
-      echo "local_time_cst=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z %z')"; } > "$RUN_DIR/path-state.txt"
-    warn "Recorded as operator-confirmed with unverified geolocation."
-    break
-  fi
-  confirm "Re-check?" || { warn "Refusing to measure through a tunnel."; exit 1; }
-done
-ask SESSION_KIND "Session kind — off-peak or peak [off-peak]:"
-SESSION_KIND="${SESSION_KIND:-off-peak}"
-echo "session_kind=$SESSION_KIND" >> "$RUN_DIR/path-state.txt"
-pause "Press Enter to start measuring."
+    if [[ "$FAKE_DNS" -gt 0 ]]; then
+      warn "A VPN or proxy is still intercepting DNS. Turn it fully off."
+    elif printf '%s' "$ORG$CC" | grep -Eqi 'gcore|g-core|akamai|linode|vultr|digitalocean|datacamp|m247|JP$'; then
+      warn "The visible exit looks like a datacenter or a Japan exit, not China Telecom."
+    elif [[ "$CC" == "CN" ]]; then
+      say "Path looks like the bare China Telecom access network."
+      { echo "vpn_state=off"; echo "public_org=$ORG"; echo "city=$CITY"; echo "country=$CC"
+        echo "geolocation=verified"
+        echo "local_time_cst=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z %z')"; } > "$RUN_DIR/path-state.txt"
+      break
+    else
+      warn "Country reads '$CC', expected CN."
+      note "Both geolocation services being unreachable is itself plausible on bare"
+      note "China Telecom and is not by itself evidence that a VPN is still up."
+    fi
+
+    # A clean resolver is the load-bearing check; geolocation is corroboration and
+    # may simply be blocked. Allow the operator to vouch, but record that they did.
+    printf '\n'
+    if [[ "$FAKE_DNS" -eq 0 ]] \
+       && confirm "Override: VPN is off and this is China Telecom 5G in Hangzhou. Proceed?"; then
+      { echo "vpn_state=off-operator-confirmed"; echo "public_org=$ORG"; echo "city=$CITY"; echo "country=$CC"
+        echo "geolocation=unverified"
+        echo "local_time_cst=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z %z')"; } > "$RUN_DIR/path-state.txt"
+      warn "Recorded as operator-confirmed with unverified geolocation."
+      break
+    fi
+    confirm "Re-check?" || { warn "Refusing to measure through a tunnel."; exit 1; }
+  done
+  ask SESSION_KIND "Session kind — off-peak or peak [off-peak]:"
+  SESSION_KIND="${SESSION_KIND:-off-peak}"
+  echo "session_kind=$SESSION_KIND" >> "$RUN_DIR/path-state.txt"
+  pause "Press Enter to start measuring."
+fi
 
 # ── Stage 6 ───────────────────────────────────────────────────────────────
 stage "Measure the raw route to the exit node"
-set -a; . "$ENV_FILE"; set +a
-MEASURE_ALLOWED=1
+set -a
+# shellcheck source=/dev/null  # private run values written by this wizard
+. "$ENV_FILE"
+set +a
+MEASURE_ALLOWED="$NODE_REACHABLE"
 if ! proof_enforce_lifecycle_bounds "$RUN_DIR/state.json"; then
   warn "lifecycle boundary reached; skip measurement and destroy the proof node"
   MEASUREMENT_FAILED=1
@@ -618,6 +726,10 @@ if ! proof_enforce_lifecycle_bounds "$RUN_DIR/state.json"; then
 fi
 say "Target: the Droplet created in Stage 4. Output folder: $RUN_DIR"
 say "This takes roughly 15 minutes. Leave the handset alone."
+printf '\n'
+warn "These iperf3 runs measure the RAW path to the Droplet, not traffic through"
+warn "the Xray tunnel. They are not tunnel-throughput evidence and must not be"
+warn "recorded as such. The route gate still needs a client-side measurement."
 printf '\n'
 
 if [[ "$MEASURE_ALLOWED" -eq 1 ]]; then
@@ -634,7 +746,7 @@ with socket.create_connection((host, 443), timeout=20):
     print("tcp/443 connected")
 PY
   run_measurement "node-readiness-services"       ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-    -i "$SSH_KEY" "root@$DROPLET_IP" 'set -e; systemctl is-active xray iperf3; /usr/local/bin/xray -version; /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json; ss -ltnp; ip -s link show; free -m; uptime'
+    -i "$SSH_KEY" "root@$DROPLET_IP" 'set -e; systemctl is-active xray; command -v iperf3; /usr/local/bin/xray -version; /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json; ss -ltnp; ip -s link show; free -m; uptime'
   run_measurement "node-host-firewall-state"      ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
     -i "$SSH_KEY" "root@$DROPLET_IP" 'set -e; if command -v ufw >/dev/null 2>&1; then ufw status verbose; fi; nft list ruleset 2>/dev/null || iptables-save'
   run_measurement "fetch-shadowrocket-profile"    scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
@@ -646,6 +758,11 @@ PY
   fi
 
   if command -v iperf3 >/dev/null 2>&1; then
+    # The server is off by default and only runs for these six transfers, so the
+    # window in which an open iperf3 port could burn transfer allowance is
+    # minutes rather than the whole lifecycle.
+    run_measurement "node-iperf3-server-start" ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      -i "$SSH_KEY" "root@$DROPLET_IP" 'systemctl start iperf3; systemctl is-active iperf3'
     for i in 1 2 3; do
       run_measurement "node-resource-before-iperf3-down-$i" ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
         -i "$SSH_KEY" "root@$DROPLET_IP" 'date -u; systemctl is-active xray iperf3; free -m; top -b -n1 | sed -n "1,20p"; ip -s link show'
@@ -662,6 +779,8 @@ PY
         -i "$SSH_KEY" "root@$DROPLET_IP" 'date -u; free -m; top -b -n1 | sed -n "1,20p"; ip -s link show'
       sleep 10
     done
+    run_measurement "node-iperf3-server-stop" ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      -i "$SSH_KEY" "root@$DROPLET_IP" 'systemctl stop iperf3; systemctl is-active iperf3 || true'
   else
     note "iperf3 missing locally — install it for the upload direction (brew install iperf3)."
     MEASUREMENT_FAILED=1
@@ -699,9 +818,14 @@ RESULT="$RUN_DIR/result.md"
   sed -n '/^## Candidate$/,$p' "$REPO_ROOT/docs/benchmark-protocol.md" 2>/dev/null \
     || echo "Fill in from the result template in docs/benchmark-protocol.md."
 } > "$RESULT"
-proof_write_manifest "$RUN_DIR" "$( [[ "$MEASUREMENT_FAILED" -ne 0 ]] && printf 'one or more measurement commands exited non-zero' || true )"
+INVALID_REASON=""
+if [[ "$MEASUREMENT_FAILED" -ne 0 ]]; then
+  INVALID_REASON="one or more measurement commands exited non-zero"
+fi
+proof_write_manifest "$RUN_DIR" "$INVALID_REASON"
 say "Pre-filled result template: $RESULT"
 say "Sanitized evidence manifest: $RUN_DIR/manifest.json"
+note "The manifest is rewritten after Stage 8 so it records the destroyed state."
 step "Fill in the measured values from the capture files."
 step "Keep it in /private/tmp. Sanitize before anything reaches an issue."
 warn "Never paste the Droplet address into GitHub."
@@ -721,21 +845,26 @@ proof_enforce_lifecycle_bounds "$RUN_DIR/state.json" \
 api GET "/droplets?per_page=200" > "$RUN_DIR/pre-destroy-live-droplets.json"
 proof_verify_destroy_boundary "$RUN_DIR/state.json" "$RUN_DIR/protected-ids.txt" "$RUN_DIR/pre-destroy-live-droplets.json" "$DROPLET_ID" \
   || { warn "destroy boundary is not exact — refusing mutation"; exit 1; }
-PROOF_CLOUD_AUTHORIZED=1 proof_require_mutation_authorized "destroy Droplet $DROPLET_ID" || exit 1
+authorize "destroy Droplet $DROPLET_ID" "Destroy Droplet $DROPLET_ID ($DROPLET_NAME) now?" || exit 1
 if do_destroy_droplet "$DROPLET_ID"; then
   sleep 15
   api GET "/droplets?per_page=200" > "$RUN_DIR/post-destroy-live-droplets.json"
   if proof_verify_protected_baseline "$RUN_DIR/protected-ids.txt" "$RUN_DIR/post-destroy-live-droplets.json"; then
     say "Account is back to its protected baseline of $PROTECTED_COUNT Droplet(s)."
+    PROOF_LIVE_DROPLET_ID=""   # nothing left to bill; stand the exit reminder down
     proof_record_destroyed "$RUN_DIR"
     proof_forget_env_keys "$ENV_FILE" DO_DROPLET_ID DO_DROPLET_IP DO_RUN_DIR
+    # Rewrite the evidence manifest now that the lifecycle is closed. Written
+    # only at Stage 7, it could never record anything but a still-live node.
+    proof_write_manifest "$RUN_DIR" "$INVALID_REASON"
+    say "Evidence manifest updated with the destroyed state: $RUN_DIR/manifest.json"
   else
     warn "Account does not exactly match the protected baseline. Check by hand."
   fi
   if [[ "$(_existing DO_SSH_KEY_UPLOADED || true)" == 1 ]]; then
     printf '\n'
-    if confirm "Delete the experiment SSH key from the DigitalOcean account?"; then
-      PROOF_CLOUD_AUTHORIZED=1 proof_require_mutation_authorized "delete experiment SSH key $KEY_ID" || exit 1
+    if authorize "delete experiment SSH key $KEY_ID" \
+         "Delete the experiment SSH key from the DigitalOcean account?"; then
       if api DELETE "/account/keys/$KEY_ID" >/dev/null; then
         say "Deleted experiment SSH key id $KEY_ID."
         proof_forget_env_keys "$ENV_FILE" DO_SSH_KEY_ID DO_SSH_KEY_UPLOADED
@@ -750,8 +879,7 @@ if do_destroy_droplet "$DROPLET_ID"; then
   step "https://cloud.digitalocean.com/networking/reserved_ips"
   step "https://cloud.digitalocean.com/volumes"
 else
-  warn "NOT destroyed. It is still billing. Destroy it before you stop for the day:"
-  note "  set -a; . $TOKEN_FILE; set +a; . $GUARD; do_destroy_droplet $DROPLET_ID"
+  warn "NOT destroyed. The exit reminder below has the exact command."
 fi
 printf '\n'
 note "To test another candidate, re-run this wizard and choose sfo3 or tor1."
