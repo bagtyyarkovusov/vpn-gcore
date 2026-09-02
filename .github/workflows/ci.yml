@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Syntax
+        run: bash -n scripts/*.sh tests/*.sh
+
+      # Diffing against the empty tree checks every tracked file, so this does
+      # not depend on how much history the checkout fetched.
+      - name: Whitespace
+        run: git diff --check "$(git hash-object -t tree /dev/null)"
+
+      # No suppressions are expected. A new finding is a review finding.
+      - name: ShellCheck
+        run: shellcheck -x scripts/*.sh tests/*.sh
+
+      - name: Proof lifecycle tests
+        run: bash tests/proof-lifecycle-test.sh

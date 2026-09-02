@@ -101,5 +101,5 @@ These probes are useful for comparison, not proof. The purchase decision should 
 
 ## Checked and excluded
 
-- [DigitalOcean](https://docs.digitalocean.com/platform/regional-availability/) does not currently list a Japan compute region.
+- [DigitalOcean](https://docs.digitalocean.com/platform/regional-availability/) does not currently list a Japan compute region. It remains excluded as a Tokyo candidate. Its San Francisco and fallback work is tracked separately in [the DigitalOcean shortlist](digitalocean-exit-candidates.md) under [ADR 0003](../adr/0003-prove-san-francisco-before-tokyo.md).
 - [UpCloud](https://upcloud.com/docs/getting-started/locations/) does not currently list a Japan or Tokyo cloud location; its published APAC locations are Singapore and Sydney.
