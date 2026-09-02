@@ -82,6 +82,63 @@ test_baseline_mismatch_fails_closed() {
   assert_file_contains "$TMPDIR/baseline.out" 'unknown Droplet 999'
 }
 
+test_recovery_resumes_exact_owned_lifecycle() {
+  local run="$TMPDIR/recovery-resume"
+  mkdir -p "$run"
+  proof_init_state "$run" sfo2 s-2vcpu-2gb ubuntu-24-04-x64 5 7 v26.6.1
+  proof_record_created "$run" 555 vpn-gcore-exp-proof sfo2 s-2vcpu-2gb
+  printf '10\n11\n' >"$run/protected-ids.txt"
+  printf '{"droplet":{"id":555,"name":"vpn-gcore-exp-proof","region":{"slug":"sfo2"},"size_slug":"s-2vcpu-2gb","tags":["vpn-gcore-experiment"]}}\n' >"$run/live-droplet.json"
+
+  proof_recovery_plan "$run/state.json" "$run/protected-ids.txt" "$run/live-droplet.json" >"$TMPDIR/resume.out" 2>&1 \
+    || fail "exact owned lifecycle did not resume"
+  assert_file_contains "$TMPDIR/resume.out" 'resume exact owned lifecycle 555'
+}
+
+test_recovery_marks_absent_droplet_for_destroyed_state() {
+  local run="$TMPDIR/recovery-absent"
+  mkdir -p "$run"
+  proof_init_state "$run" sfo2 s-2vcpu-2gb ubuntu-24-04-x64 5 7 v26.6.1
+  proof_record_created "$run" 555 vpn-gcore-exp-proof sfo2 s-2vcpu-2gb
+  printf '10\n11\n' >"$run/protected-ids.txt"
+  printf '{"droplet":null}\n' >"$run/live-droplet.json"
+
+  proof_recovery_plan "$run/state.json" "$run/protected-ids.txt" "$run/live-droplet.json" >"$TMPDIR/absent.out" 2>&1 \
+    || fail "absent Droplet recovery did not succeed"
+  assert_file_contains "$TMPDIR/absent.out" 'mark lifecycle destroyed after baseline verification'
+}
+
+test_successful_lifecycle_reaches_destroyed_state() {
+  local run="$TMPDIR/success"
+  mkdir -p "$run"
+  proof_init_state "$run" sfo2 s-2vcpu-2gb ubuntu-24-04-x64 5 7 v26.6.1
+  assert_json_field "$run/state.json" "data['state']" "initialized"
+
+  proof_record_created "$run" 555 vpn-gcore-exp-proof sfo2 s-2vcpu-2gb
+  assert_json_field "$run/state.json" "data['state']" "created"
+
+  proof_record_outcome "$run" "node-tcp443-connect" 0
+  proof_record_outcome "$run" "node-readiness-services" 0
+
+  printf '100\n101\n' >"$run/protected.txt"
+  printf '{"droplets":[{"id":100},{"id":101},{"id":555,"name":"vpn-gcore-exp-proof","region":{"slug":"sfo2"},"size_slug":"s-2vcpu-2gb","tags":["vpn-gcore-experiment"]}]}\n' >"$run/live.json"
+  proof_verify_destroy_boundary "$run/state.json" "$run/protected.txt" "$run/live.json" 555 \
+    || fail "success path failed the destroy boundary"
+
+  printf '{"droplets":[{"id":100},{"id":101}]}\n' >"$run/post-destroy.json"
+  proof_verify_protected_baseline "$run/protected.txt" "$run/post-destroy.json" \
+    || fail "success path failed post-destroy baseline verification"
+
+  proof_record_destroyed "$run"
+  proof_write_manifest "$run" ""
+
+  assert_json_field "$run/manifest.json" "data['state']" "destroyed"
+  assert_json_field "$run/manifest.json" "data['outcomes']['node-tcp443-connect']['passed']" "True"
+  assert_json_field "$run/manifest.json" "'destroyed_at_utc' in data" "True"
+  # a valid session is marked by an empty reason, never by an absent key
+  assert_json_field "$run/manifest.json" "data['invalid_session_reason']" ""
+}
+
 test_recovery_refuses_wrong_ownership() {
   local run="$TMPDIR/recovery"
   mkdir -p "$run"
@@ -260,6 +317,9 @@ main() {
   test_manifest_records_versions_checksums_statuses_and_redacts_ip
   test_baseline_mismatch_fails_closed
   test_recovery_refuses_wrong_ownership
+  test_recovery_resumes_exact_owned_lifecycle
+  test_recovery_marks_absent_droplet_for_destroyed_state
+  test_successful_lifecycle_reaches_destroyed_state
   test_dry_run_blocks_cloud_mutation
   test_env_cleanup_removes_only_lifecycle_keys
   test_wizard_passes_pinned_xray_version_to_state
