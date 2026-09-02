@@ -126,6 +126,80 @@ test_env_cleanup_removes_only_lifecycle_keys() {
   ! grep -q '^DO_RUN_DIR=' "$env" || fail "old run directory remained in env"
 }
 
+# shellcheck disable=SC2016  # these patterns are literal source text, not expansions
+test_wizard_passes_pinned_xray_version_to_state() {
+  local wizard="$ROOT/scripts/do-route-wizard.sh"
+  assert_file_contains "$wizard" '^XRAY_VERSION="v[0-9]'
+  grep -q 'proof_init_state .*"\$MAX_PROOF_LIFECYCLE_DAYS" "\$XRAY_VERSION"' "$wizard" \
+    || fail "wizard does not pass XRAY_VERSION into proof_init_state"
+}
+
+test_pinned_xray_version_reaches_state_and_manifest() {
+  local run="$TMPDIR/xray-version"
+  mkdir -p "$run"
+  proof_init_state "$run" sfo2 s-2vcpu-2gb ubuntu-24-04-x64 5 7 v26.6.1
+  proof_record_created "$run" 555 vpn-gcore-exp-proof sfo2 s-2vcpu-2gb
+  proof_write_manifest "$run" ""
+
+  assert_json_field "$run/state.json" "data['xray_version']" "v26.6.1"
+  assert_json_field "$run/manifest.json" "data['xray_version']" "v26.6.1"
+}
+
+test_manifest_omits_xray_version_when_unpinned() {
+  local run="$TMPDIR/xray-version-absent"
+  mkdir -p "$run"
+  proof_init_state "$run" sfo2 s-2vcpu-2gb ubuntu-24-04-x64 5 7
+  proof_write_manifest "$run" ""
+
+  assert_json_field "$run/manifest.json" "'xray_version' in data" "False"
+}
+
+test_destroy_boundary_accepts_exact_owned_target() {
+  local run="$TMPDIR/destroy-owned"
+  mkdir -p "$run"
+  proof_init_state "$run" sfo2 s-2vcpu-2gb ubuntu-24-04-x64 5 7
+  proof_record_created "$run" 555 vpn-gcore-exp-proof sfo2 s-2vcpu-2gb
+  printf '100\n101\n' >"$run/protected.txt"
+  printf '{"droplets":[{"id":100},{"id":101},{"id":555,"name":"vpn-gcore-exp-proof","region":{"slug":"sfo2"},"size_slug":"s-2vcpu-2gb","tags":["vpn-gcore-experiment"]}]}\n' >"$run/live.json"
+
+  proof_verify_destroy_boundary "$run/state.json" "$run/protected.txt" "$run/live.json" 555 \
+    || fail "exact owned target did not pass destroy boundary"
+}
+
+test_destroy_boundary_refuses_missing_ownership_tag() {
+  local run="$TMPDIR/destroy-missing-tag"
+  mkdir -p "$run"
+  proof_init_state "$run" sfo2 s-2vcpu-2gb ubuntu-24-04-x64 5 7
+  proof_record_created "$run" 555 vpn-gcore-exp-proof sfo2 s-2vcpu-2gb
+  printf '100\n101\n' >"$run/protected.txt"
+  printf '{"droplets":[{"id":100},{"id":101},{"id":555,"name":"vpn-gcore-exp-proof","region":{"slug":"sfo2"},"size_slug":"s-2vcpu-2gb","tags":["other-tag"]}]}\n' >"$run/live.json"
+
+  set +e
+  proof_verify_destroy_boundary "$run/state.json" "$run/protected.txt" "$run/live.json" 555 >"$TMPDIR/missing-tag.out" 2>&1
+  local status=$?
+  set -e
+
+  [[ "$status" -ne 0 ]] || fail "missing ownership tag passed destroy boundary"
+  assert_file_contains "$TMPDIR/missing-tag.out" 'missing required ownership tag'
+}
+
+test_destroy_boundary_refuses_identity_mismatch() {
+  local run="$TMPDIR/destroy-wrong-name"
+  mkdir -p "$run"
+  proof_init_state "$run" sfo2 s-2vcpu-2gb ubuntu-24-04-x64 5 7
+  proof_record_created "$run" 555 vpn-gcore-exp-proof sfo2 s-2vcpu-2gb
+  printf '100\n101\n' >"$run/protected.txt"
+  printf '{"droplets":[{"id":100},{"id":101},{"id":555,"name":"wrong-name","region":{"slug":"sfo2"},"size_slug":"s-2vcpu-2gb","tags":["vpn-gcore-experiment"]}]}\n' >"$run/live.json"
+
+  set +e
+  proof_verify_destroy_boundary "$run/state.json" "$run/protected.txt" "$run/live.json" 555 >"$TMPDIR/wrong-name.out" 2>&1
+  local status=$?
+  set -e
+
+  [[ "$status" -ne 0 ]] || fail "identity mismatch passed destroy boundary"
+  assert_file_contains "$TMPDIR/wrong-name.out" 'name mismatch'
+}
+
 test_lifecycle_bounds_fail_when_state_is_stale() {
   local run="$TMPDIR/stale"
   mkdir -p "$run"
@@ -151,17 +225,34 @@ PY
 }
 
 test_destroy_boundary_refuses_protected_target() {
-  local protected="$TMPDIR/destroy-protected.txt" live="$TMPDIR/destroy-live.json"
-  printf '555\n777\n' >"$protected"
-  printf '{"droplets":[{"id":555},{"id":777}]}\n' >"$live"
+  local run="$TMPDIR/destroy-protected"
+  mkdir -p "$run"
+  proof_init_state "$run" sfo2 s-2vcpu-2gb ubuntu-24-04-x64 5 7
+  proof_record_created "$run" 555 vpn-gcore-exp-proof sfo2 s-2vcpu-2gb
+  printf '555\n777\n' >"$run/protected.txt"
+  printf '{"droplets":[{"id":555,"name":"vpn-gcore-exp-proof","region":{"slug":"sfo2"},"size_slug":"s-2vcpu-2gb","tags":["vpn-gcore-experiment"]},{"id":777}]}\n' >"$run/live.json"
 
   set +e
-  proof_verify_destroy_boundary "$protected" "$live" 555 >"$TMPDIR/destroy.out" 2>&1
+  proof_verify_destroy_boundary "$run/state.json" "$run/protected.txt" "$run/live.json" 555 >"$TMPDIR/destroy.out" 2>&1
   local status=$?
   set -e
 
   [[ "$status" -ne 0 ]] || fail "protected target destroy boundary passed"
   assert_file_contains "$TMPDIR/destroy.out" 'protected baseline'
+}
+
+test_post_destroy_baseline_requires_exact_ids() {
+  local protected="$TMPDIR/post-destroy-protected.txt" live="$TMPDIR/post-destroy-live.json"
+  printf '100\n101\n' >"$protected"
+  printf '{"droplets":[{"id":100},{"id":999}]}\n' >"$live"
+
+  set +e
+  proof_verify_protected_baseline "$protected" "$live" >"$TMPDIR/post-destroy.out" 2>&1
+  local status=$?
+  set -e
+
+  [[ "$status" -ne 0 ]] || fail "changed baseline ids passed post-destroy verification"
+  assert_file_contains "$TMPDIR/post-destroy.out" 'unknown Droplet 999'
 }
 
 main() {
@@ -171,8 +262,15 @@ main() {
   test_recovery_refuses_wrong_ownership
   test_dry_run_blocks_cloud_mutation
   test_env_cleanup_removes_only_lifecycle_keys
+  test_wizard_passes_pinned_xray_version_to_state
+  test_pinned_xray_version_reaches_state_and_manifest
+  test_manifest_omits_xray_version_when_unpinned
+  test_destroy_boundary_accepts_exact_owned_target
+  test_destroy_boundary_refuses_missing_ownership_tag
+  test_destroy_boundary_refuses_identity_mismatch
   test_lifecycle_bounds_fail_when_state_is_stale
   test_destroy_boundary_refuses_protected_target
+  test_post_destroy_baseline_requires_exact_ids
   printf 'ok - proof lifecycle tests\n'
 }
 

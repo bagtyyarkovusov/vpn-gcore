@@ -33,14 +33,14 @@ PY
 }
 
 proof_init_state() {
-  local run_dir="$1" region="$2" size="$3" image="$4" max_budget_usd="$5" max_lifecycle_days="$6"
+  local run_dir="$1" region="$2" size="$3" image="$4" max_budget_usd="$5" max_lifecycle_days="$6" xray_version="${7:-}"
   mkdir -p "$run_dir"
-  python3 - "$run_dir/state.json" "$region" "$size" "$image" "$max_budget_usd" "$max_lifecycle_days" <<'PY'
+  python3 - "$run_dir/state.json" "$region" "$size" "$image" "$max_budget_usd" "$max_lifecycle_days" "$xray_version" <<'PY'
 import datetime as dt
 import json
 import sys
 
-path, region, size, image, max_budget, max_days = sys.argv[1:]
+path, region, size, image, max_budget, max_days, xray_version = sys.argv[1:]
 created = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 data = {
     "schema_version": 1,
@@ -55,6 +55,8 @@ data = {
     "ownership_tag": "vpn-gcore-experiment",
     "outcomes": {},
 }
+if xray_version:
+    data["xray_version"] = xray_version
 with open(path, "w", encoding="utf-8") as fh:
     json.dump(data, fh, indent=2, sort_keys=True)
     fh.write("\n")
@@ -87,6 +89,17 @@ data["region"] = region
 data["size"] = size
 data["updated_at_utc"] = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 ' "$droplet_id" "$droplet_name" "$region" "$size"
+}
+
+proof_record_ssh_key() {
+  local run_dir="$1" key_id="$2" uploaded="$3"
+  proof_json_update "$run_dir/state.json" '
+import datetime as dt
+key_id, uploaded = args
+data["ssh_key_id"] = str(key_id)
+data["ssh_key_uploaded_by_lifecycle"] = uploaded == "1"
+data["updated_at_utc"] = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+' "$key_id" "$uploaded"
 }
 
 proof_record_destroyed() {
@@ -184,23 +197,44 @@ proof_verify_protected_baseline_json() {
 }
 
 proof_verify_destroy_boundary() {
-  local protected_ids_file="$1" live_json_file="$2" droplet_id="$3"
-  python3 - "$protected_ids_file" "$live_json_file" "$droplet_id" <<'PY'
+  local state_file="$1" protected_ids_file="$2" live_json_file="$3" droplet_id="$4"
+  python3 - "$state_file" "$protected_ids_file" "$live_json_file" "$droplet_id" "$PROOF_TAG" <<'PY'
 import json
 import sys
 
-protected_path, live_path, target_id = sys.argv[1:]
+state_path, protected_path, live_path, target_id, required_tag = sys.argv[1:]
+state = json.load(open(state_path, encoding="utf-8"))
 protected = {line.strip() for line in open(protected_path, encoding="utf-8") if line.strip()}
 live = json.load(open(live_path, encoding="utf-8"))
-ids = {str(d["id"]) for d in live.get("droplets", [])}
+droplets = live.get("droplets", [])
+ids = {str(d["id"]) for d in droplets}
+target = next((d for d in droplets if str(d.get("id")) == target_id), None)
 
 if target_id in protected:
     print(f"target Droplet {target_id} is in the protected baseline; refusing destroy", file=sys.stderr)
     sys.exit(1)
 
-if target_id not in ids:
+if target is None:
     print(f"target Droplet {target_id} is not present; verify baseline by hand", file=sys.stderr)
     sys.exit(1)
+
+if target_id != str(state.get("droplet_id", "")):
+    print(f"target Droplet {target_id} does not match recorded lifecycle", file=sys.stderr)
+    sys.exit(1)
+
+if required_tag not in target.get("tags", []):
+    print(f"target Droplet {target_id} is missing required ownership tag {required_tag}", file=sys.stderr)
+    sys.exit(1)
+
+checks = [
+    ("name", target.get("name"), state.get("droplet_name")),
+    ("region", target.get("region", {}).get("slug"), state.get("region")),
+    ("size", target.get("size_slug"), state.get("size")),
+]
+for label, actual, expected in checks:
+    if str(actual) != str(expected):
+        print(f"{label} mismatch for target Droplet {target_id}: expected {expected}, got {actual}", file=sys.stderr)
+        sys.exit(1)
 
 remaining = ids - {target_id}
 if remaining != protected:
@@ -339,6 +373,7 @@ manifest = {
         "max_budget_usd",
         "max_lifecycle_days",
         "ownership_tag",
+        "xray_version",
         "outcomes",
     )
     if key in state

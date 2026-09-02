@@ -2,8 +2,8 @@
 
 `scripts/do-route-wizard.sh` is the only approved path for a temporary
 DigitalOcean proof node. It is a human-driven workflow: the operator must review
-the exact name, region, size, image, tag, billing note, and protected-baseline
-status before authorizing creation.
+the exact name, region, size, image, tag, pinned Xray version, billing note, and
+protected-baseline status before authorizing creation.
 
 ## Boundaries
 
@@ -11,18 +11,32 @@ status before authorizing creation.
   most USD 5. If the boundary is reached, stop measurement and use the guarded
   single-resource destroy path.
 - The wizard checks the protected baseline before creation and checks it again
-  after destruction.
+  after destruction by exact Droplet ID, not by count alone.
 - A cloud mutation is allowed only after the wizard's explicit confirmation
   prompt. Tests and dry-runs must not set that authorization.
-- A destroy action must target the recorded Droplet ID and pass the guard's
-  ownership checks. Never widen the target to an account, region, or tag sweep.
+- Uploading the experiment SSH key is also a cloud mutation. The wizard prompts
+  separately before upload, records whether this lifecycle created the account
+  key, and prompts to delete that key after the proof node is destroyed.
+- A destroy action must target the recorded Droplet ID and pass committed
+  lifecycle checks plus the private guard's ownership checks. The committed
+  check verifies target ID, ownership tag, name, region, size, and the remaining
+  protected baseline before deletion. Never widen the target to an account,
+  region, or tag sweep.
 
 ## Evidence
 
 Every measurement capture records the command line and its real exit code. A
 failed probe marks the session invalid until the operator records a specific
-reason. The wizard writes private raw captures and a sanitized `manifest.json`
-under `/private/tmp`; publish only reviewed, redacted summaries.
+reason. The wizard writes private raw captures, the private tunnel profile, and
+a sanitized `manifest.json` under `/private/tmp`; publish only reviewed,
+redacted summaries.
+
+The proof node installs pinned Xray with VLESS, REALITY, XTLS Vision, RAW TCP,
+and systemd supervision on TCP/443. Readiness captures include TCP/443 reachability,
+Xray service status, Xray config validation, host firewall state, DNS state,
+DigitalOcean firewall state, and server CPU, memory, and network counters around
+throughput runs. The generated tunnel profile contains live secrets and must
+never be pasted into GitHub or committed output.
 
 The manifest records lifecycle state, timestamps, region, size, image, budget
 and duration limits, command outcomes, capture checksums, tool versions, and any

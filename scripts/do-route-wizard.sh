@@ -198,6 +198,7 @@ API="https://api.digitalocean.com/v2"
 TAG="vpn-gcore-experiment"
 MAX_PROOF_BUDGET_USD=5
 MAX_PROOF_LIFECYCLE_DAYS=7
+XRAY_VERSION="v26.6.1"
 
 # shellcheck source=scripts/proof-lifecycle.sh
 . "$REPO_ROOT/scripts/proof-lifecycle.sh"
@@ -354,7 +355,7 @@ ask DO_IMAGE "Image [ubuntu-24-04-x64]:"; DO_IMAGE="${DO_IMAGE:-ubuntu-24-04-x64
 write_env DO_REGION "$DO_REGION"
 write_env DO_SIZE "$DO_SIZE"
 write_env DO_IMAGE "$DO_IMAGE"
-proof_init_state "$RUN_DIR" "$DO_REGION" "$DO_SIZE" "$DO_IMAGE" "$MAX_PROOF_BUDGET_USD" "$MAX_PROOF_LIFECYCLE_DAYS"
+proof_init_state "$RUN_DIR" "$DO_REGION" "$DO_SIZE" "$DO_IMAGE" "$MAX_PROOF_BUDGET_USD" "$MAX_PROOF_LIFECYCLE_DAYS" "$XRAY_VERSION"
 printf '\n'
 note "Billing is hourly. A 4-hour cycle on s-2vcpu-2gb costs about USD 0.11."
 note "This proof lifecycle is bounded to ${MAX_PROOF_LIFECYCLE_DAYS} days and USD ${MAX_PROOF_BUDGET_USD}."
@@ -386,14 +387,20 @@ if [[ -z "$KEY_ID" ]]; then
   api GET "/droplets?per_page=200" > "$RUN_DIR/pre-key-live-droplets.json"
   proof_verify_protected_baseline_json "$PROTECTED_IDS" "$RUN_DIR/pre-key-live-droplets.json" \
     || { warn "baseline changed before SSH-key upload — refusing mutation"; exit 1; }
+  confirm "Upload this experiment public SSH key to the DigitalOcean account?" \
+    || { warn "SSH-key upload not authorized; stopping before cloud mutation."; exit 1; }
   PROOF_CLOUD_AUTHORIZED=1 proof_require_mutation_authorized "upload experiment SSH key" || exit 1
   KEY_ID=$(api POST /account/keys "$(python3 -c '
 import json,sys
 print(json.dumps({"name":"vpn-gcore-experiment","public_key":sys.argv[1]}))' "$PUBKEY")" \
     | jqp 'print(json.load(sys.stdin)["ssh_key"]["id"])')
   say "Uploaded the public key to DigitalOcean as key id $KEY_ID."
+  write_env DO_SSH_KEY_UPLOADED 1
+  proof_record_ssh_key "$RUN_DIR" "$KEY_ID" 1
 else
   say "Public key already registered as key id $KEY_ID."
+  write_env DO_SSH_KEY_UPLOADED 0
+  proof_record_ssh_key "$RUN_DIR" "$KEY_ID" 0
 fi
 write_env DO_SSH_KEY_ID "$KEY_ID"
 pause "Press Enter."
@@ -408,6 +415,7 @@ step "region  $DO_REGION"
 step "plan    $DO_SIZE"
 step "image   $DO_IMAGE"
 step "tag     $TAG   (this tag is what makes it destroyable)"
+step "xray    $XRAY_VERSION  VLESS + REALITY + XTLS Vision on TCP/443"
 step "extras  IPv6 on, monitoring on, backups off"
 printf '\n'
 warn "This consumes the account's last free Droplet slot and starts billing."
@@ -420,20 +428,81 @@ if ! PROOF_CLOUD_AUTHORIZED=1 proof_require_mutation_authorized "create Droplet 
   exit 0
 fi
 
-# Take the guard's tagged payload, then add the measurement server bootstrap.
+# Take the guard's tagged payload, then add the proof-node bootstrap.
 BASE_PAYLOAD=$(do_create_droplet_payload "$DROPLET_NAME" "$DO_REGION" "$DO_SIZE" "$DO_IMAGE" "$KEY_ID")
-USER_DATA=$(cat <<'CLOUDINIT'
+USER_DATA=$(cat <<CLOUDINIT
 #!/bin/bash
 set -eux
 export DEBIAN_FRONTEND=noninteractive
+XRAY_VERSION="$XRAY_VERSION"
 apt-get update -y
-apt-get install -y nginx iperf3
-head -c 104857600 /dev/urandom > /var/www/html/100MB.bin
-printf 'server {\n listen 443 default_server;\n listen [::]:443 default_server;\n root /var/www/html;\n}\n' > /etc/nginx/sites-available/tcp443
-ln -sf /etc/nginx/sites-available/tcp443 /etc/nginx/sites-enabled/tcp443
-systemctl enable --now nginx
-nginx -t
-systemctl reload nginx
+apt-get install -y ca-certificates curl iperf3 openssl
+bash -c "\$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "\$XRAY_VERSION"
+install -d -m 700 /root/vpn-gcore-proof
+VLESS_UUID="\$(cat /proc/sys/kernel/random/uuid)"
+KEYPAIR="\$(/usr/local/bin/xray x25519)"
+REALITY_PRIVATE_KEY="\$(printf '%s\n' "\$KEYPAIR" | awk '/Private key:/ {print \$3}')"
+REALITY_PUBLIC_KEY="\$(printf '%s\n' "\$KEYPAIR" | awk '/Public key:/ {print \$3}')"
+SHORT_ID="\$(openssl rand -hex 8)"
+SERVER_NAME="www.apple.com"
+TARGET="www.apple.com:443"
+PUBLIC_IPV4="\$(curl -4 -sS --max-time 10 https://api.ipify.org || hostname -I | awk '{print \$1}')"
+cat > /usr/local/etc/xray/config.json <<XRAY_CONFIG
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "vless-reality-proof",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "\$VLESS_UUID",
+            "level": 0,
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "\$TARGET",
+          "xver": 0,
+          "serverNames": [
+            "\$SERVER_NAME"
+          ],
+          "privateKey": "\$REALITY_PRIVATE_KEY",
+          "shortIds": [
+            "\$SHORT_ID"
+          ],
+          "fingerprint": "chrome"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    }
+  ]
+}
+XRAY_CONFIG
+chmod 600 /usr/local/etc/xray/config.json
+cat > /root/vpn-gcore-proof/shadowrocket-vless-reality.uri <<PROFILE
+vless://\$VLESS_UUID@\$PUBLIC_IPV4:443?encryption=none&security=reality&sni=\$SERVER_NAME&fp=chrome&pbk=\$REALITY_PUBLIC_KEY&sid=\$SHORT_ID&type=tcp&flow=xtls-rprx-vision#vpn-gcore-\$XRAY_VERSION-proof
+PROFILE
+chmod 600 /root/vpn-gcore-proof/shadowrocket-vless-reality.uri
+/usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json
+systemctl enable --now xray
+systemctl restart xray
 printf '[Unit]\nDescription=iperf3\n[Service]\nExecStart=/usr/bin/iperf3 -s\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/iperf3.service
 systemctl daemon-reload
 systemctl enable --now iperf3
@@ -472,7 +541,7 @@ done
 [[ -n "$DROPLET_IP" ]] || { warn "Droplet never became active. Destroy it in Stage 8."; }
 write_env DO_DROPLET_IP "$DROPLET_IP"
 say "Address assigned. It is stored in $ENV_FILE and never printed to a public place."
-note "The bootstrap installs nginx and iperf3; give it about two minutes."
+note "The bootstrap installs Xray $XRAY_VERSION and iperf3; give it about two minutes."
 pause "Press Enter once you are ready to switch networks."
 
 # ── Stage 5 ───────────────────────────────────────────────────────────────
@@ -556,30 +625,46 @@ if [[ "$MEASURE_ALLOWED" -eq 1 ]]; then
   run_measurement "node-ping-100"                 ping -c 100 "$DROPLET_IP"
   run_measurement "node-traceroute-icmp"          traceroute -I -q 3 "$DROPLET_IP"
   run_measurement "node-traceroute-tcp443"        traceroute -P TCP -p 443 -q 3 "$DROPLET_IP"
-  run_measurement "node-tcp443-connect"           curl -4 -sS -o /dev/null -m 20 \
-    -w 'connect=%{time_connect}s total=%{time_total}s code=%{http_code}\n' "http://$DROPLET_IP:443/"
+  run_measurement "node-tcp443-connect"           python3 - "$DROPLET_IP" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+with socket.create_connection((host, 443), timeout=20):
+    print("tcp/443 connected")
+PY
   run_measurement "node-readiness-services"       ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-    -i "$SSH_KEY" "root@$DROPLET_IP" 'set -e; systemctl is-active nginx iperf3; ss -ltnp; ip -s link show; uptime'
+    -i "$SSH_KEY" "root@$DROPLET_IP" 'set -e; systemctl is-active xray iperf3; /usr/local/bin/xray -version; /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json; ss -ltnp; ip -s link show; free -m; uptime'
   run_measurement "node-host-firewall-state"      ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
     -i "$SSH_KEY" "root@$DROPLET_IP" 'set -e; if command -v ufw >/dev/null 2>&1; then ufw status verbose; fi; nft list ruleset 2>/dev/null || iptables-save'
+  run_measurement "fetch-shadowrocket-profile"    scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+    -i "$SSH_KEY" "root@$DROPLET_IP:/root/vpn-gcore-proof/shadowrocket-vless-reality.uri" "$RUN_DIR/shadowrocket-vless-reality.uri"
   run_measurement "control-dns-state"             sh -c 'set -e; dig +short example.com; scutil --dns 2>/dev/null | sed -n "1,80p" || true'
   if ! api GET "/firewalls?per_page=200" > "$RUN_DIR/do-firewalls-readonly.json"; then
     warn "could not capture DigitalOcean firewall state"
     MEASUREMENT_FAILED=1
   fi
 
-  for i in 1 2 3; do
-    run_measurement "node-download-100mb-$i" curl -4 -L -o /dev/null -sS --max-time 300 \
-      -w 'code=%{http_code} bytes=%{size_download} time=%{time_total}s speed=%{speed_download}B/s\n' \
-      "http://$DROPLET_IP/100MB.bin"
-    sleep 10
-  done
-
   if command -v iperf3 >/dev/null 2>&1; then
-    run_measurement "node-iperf3-down" iperf3 -c "$DROPLET_IP" -R -t 30 -P 4
-    run_measurement "node-iperf3-up"   iperf3 -c "$DROPLET_IP"    -t 30 -P 4
+    for i in 1 2 3; do
+      run_measurement "node-resource-before-iperf3-down-$i" ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        -i "$SSH_KEY" "root@$DROPLET_IP" 'date -u; systemctl is-active xray iperf3; free -m; top -b -n1 | sed -n "1,20p"; ip -s link show'
+      run_measurement "node-iperf3-down-$i" iperf3 -c "$DROPLET_IP" -R -t 30 -P 4
+      run_measurement "node-resource-after-iperf3-down-$i" ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        -i "$SSH_KEY" "root@$DROPLET_IP" 'date -u; free -m; top -b -n1 | sed -n "1,20p"; ip -s link show'
+      sleep 10
+    done
+    for i in 1 2 3; do
+      run_measurement "node-resource-before-iperf3-up-$i" ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        -i "$SSH_KEY" "root@$DROPLET_IP" 'date -u; systemctl is-active xray iperf3; free -m; top -b -n1 | sed -n "1,20p"; ip -s link show'
+      run_measurement "node-iperf3-up-$i" iperf3 -c "$DROPLET_IP" -t 30 -P 4
+      run_measurement "node-resource-after-iperf3-up-$i" ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        -i "$SSH_KEY" "root@$DROPLET_IP" 'date -u; free -m; top -b -n1 | sed -n "1,20p"; ip -s link show'
+      sleep 10
+    done
   else
     note "iperf3 missing locally — install it for the upload direction (brew install iperf3)."
+    MEASUREMENT_FAILED=1
   fi
 
   say "Now a 30-minute continuous latency run to expose bursts of loss."
@@ -634,18 +719,32 @@ printf '\n'
 proof_enforce_lifecycle_bounds "$RUN_DIR/state.json" \
   || warn "lifecycle boundary reached; destruction is the only allowed mutation."
 api GET "/droplets?per_page=200" > "$RUN_DIR/pre-destroy-live-droplets.json"
-proof_verify_destroy_boundary "$RUN_DIR/protected-ids.txt" "$RUN_DIR/pre-destroy-live-droplets.json" "$DROPLET_ID" \
+proof_verify_destroy_boundary "$RUN_DIR/state.json" "$RUN_DIR/protected-ids.txt" "$RUN_DIR/pre-destroy-live-droplets.json" "$DROPLET_ID" \
   || { warn "destroy boundary is not exact — refusing mutation"; exit 1; }
 PROOF_CLOUD_AUTHORIZED=1 proof_require_mutation_authorized "destroy Droplet $DROPLET_ID" || exit 1
 if do_destroy_droplet "$DROPLET_ID"; then
   sleep 15
-  AFTER=$(api GET "/droplets?per_page=200" | jqp 'print(len(json.load(sys.stdin)["droplets"]))')
-  if [[ "$AFTER" == "$PROTECTED_COUNT" ]]; then
+  api GET "/droplets?per_page=200" > "$RUN_DIR/post-destroy-live-droplets.json"
+  if proof_verify_protected_baseline "$RUN_DIR/protected-ids.txt" "$RUN_DIR/post-destroy-live-droplets.json"; then
     say "Account is back to its protected baseline of $PROTECTED_COUNT Droplet(s)."
     proof_record_destroyed "$RUN_DIR"
     proof_forget_env_keys "$ENV_FILE" DO_DROPLET_ID DO_DROPLET_IP DO_RUN_DIR
   else
-    warn "Account shows $AFTER Droplet(s), expected $PROTECTED_COUNT. Check by hand."
+    warn "Account does not exactly match the protected baseline. Check by hand."
+  fi
+  if [[ "$(_existing DO_SSH_KEY_UPLOADED || true)" == 1 ]]; then
+    printf '\n'
+    if confirm "Delete the experiment SSH key from the DigitalOcean account?"; then
+      PROOF_CLOUD_AUTHORIZED=1 proof_require_mutation_authorized "delete experiment SSH key $KEY_ID" || exit 1
+      if api DELETE "/account/keys/$KEY_ID" >/dev/null; then
+        say "Deleted experiment SSH key id $KEY_ID."
+        proof_forget_env_keys "$ENV_FILE" DO_SSH_KEY_ID DO_SSH_KEY_UPLOADED
+      else
+        warn "Could not delete experiment SSH key id $KEY_ID. Check by hand."
+      fi
+    else
+      warn "Experiment SSH key was left in the account; delete key id $KEY_ID by hand."
+    fi
   fi
   say "Also confirm no reserved IP or volume was left behind:"
   step "https://cloud.digitalocean.com/networking/reserved_ips"
