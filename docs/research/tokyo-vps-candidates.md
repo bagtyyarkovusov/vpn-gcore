@@ -101,5 +101,5 @@ These probes are useful for comparison, not proof. The purchase decision should 
 
 ## Checked and excluded
 
-- [DigitalOcean](https://docs.digitalocean.com/platform/regional-availability/) does not currently list a Japan compute region. Confirmed against the live regions API on 2026-09-02: its only Asia-Pacific regions are `sgp1` Singapore, `blr1` Bangalore, and `syd1` Sydney. It also publishes no working test endpoint, because the former `speedtest-<region>.digitalocean.com` hosts no longer resolve on public DNS, so its route cannot be screened before renting. It is excluded as a Tokyo candidate and used only as a disposable rehearsal target for provisioning and measurement tooling, per [ADR 0002](../adr/0002-rehearse-provisioning-on-digitalocean.md).
+- [DigitalOcean](https://docs.digitalocean.com/platform/regional-availability/) does not currently list a Japan compute region. It remains excluded as a Tokyo candidate. Its San Francisco and fallback work is tracked separately in [the DigitalOcean shortlist](digitalocean-exit-candidates.md) under [ADR 0003](../adr/0003-prove-san-francisco-before-tokyo.md).
 - [UpCloud](https://upcloud.com/docs/getting-started/locations/) does not currently list a Japan or Tokyo cloud location; its published APAC locations are Singapore and Sydney.

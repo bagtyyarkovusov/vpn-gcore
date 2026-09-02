@@ -274,23 +274,53 @@ pause "Baseline verified. Press Enter."
 
 # ── Stage 2 ───────────────────────────────────────────────────────────────
 stage "Choose the region and plan"
-say "DigitalOcean has no Japan region. Its only Asia-Pacific regions are:"
+say "Current exit-location candidates:"
 printf '\n'
-step "sgp1  Singapore  — closest to China Telecom, best route odds"
-step "blr1  Bangalore"
-step "syd1  Sydney"
+step "sfo2  San Francisco  — primary candidate"
+step "sfo3  San Francisco  — same-city replacement candidate"
+step "tor1  Toronto        — geographic fallback"
 printf '\n'
-warn "Whatever this measures is NOT Tokyo route evidence. It is a rehearsal of"
-warn "provisioning, tunnelling and measurement tooling. Do not file the result"
-warn "against the Tokyo route gate."
+warn "A DigitalOcean result is never Tokyo evidence. Record it against the"
+warn "San Francisco exit-location work in ADR 0003."
 printf '\n'
-ask DO_REGION "Region [sgp1]:"; DO_REGION="${DO_REGION:-sgp1}"
+# Both of these are slugs, not menu numbers, and a wrong one is only rejected
+# by the API at create time — after the confirmation prompt, and far enough in
+# that it reads like a provisioning failure. Validate them here instead.
+for _attempt in 1 2 3; do
+  ask DO_REGION "Region slug [sfo2]:"; DO_REGION="${DO_REGION:-sfo2}"
+  api GET "/regions?per_page=200" | jqp '
+regions = json.load(sys.stdin)["regions"]
+sys.exit(0 if any(r["slug"] == sys.argv[1] and r["available"] for r in regions) else 1)
+' "$DO_REGION" && break
+  warn "\"$DO_REGION\" is not an available region slug. Type the slug itself, e.g. sfo2."
+  [[ "$_attempt" == 3 ]] && { warn "no valid region after 3 attempts — stopping"; exit 1; }
+done
+
 say "Plans available in that region under the USD 20 ceiling:"
 step "s-2vcpu-2gb  2 vCPU / 2 GB / 3 TB   \$18/mo  \$0.02679/hr   ← recommended"
 step "s-1vcpu-2gb  1 vCPU / 2 GB / 2 TB   \$12/mo  \$0.01786/hr"
 step "s-1vcpu-1gb  1 vCPU / 1 GB / 1 TB    \$6/mo  \$0.00893/hr"
+note "Type the slug, not the line number."
 printf '\n'
-ask DO_SIZE "Plan [s-2vcpu-2gb]:"; DO_SIZE="${DO_SIZE:-s-2vcpu-2gb}"
+for _attempt in 1 2 3; do
+  ask DO_SIZE "Plan slug [s-2vcpu-2gb]:"; DO_SIZE="${DO_SIZE:-s-2vcpu-2gb}"
+  api GET "/sizes?per_page=500" | jqp '
+sizes = json.load(sys.stdin)["sizes"]
+slug, region = sys.argv[1], sys.argv[2]
+for s in sizes:
+    if s["slug"] != slug:
+        continue
+    if not s["available"]:
+        sys.stderr.write("that plan is not currently available\n"); sys.exit(1)
+    if region not in s["regions"]:
+        sys.stderr.write("that plan is not offered in %s\n" % region); sys.exit(1)
+    print("%s: USD %s/mo, USD %.5f/hr" % (slug, s["price_monthly"], s["price_hourly"]))
+    sys.exit(0)
+sys.stderr.write("no such plan slug\n"); sys.exit(1)
+' "$DO_SIZE" "$DO_REGION" && break
+  warn "\"$DO_SIZE\" is not a usable plan slug in $DO_REGION. Type the slug, e.g. s-2vcpu-2gb."
+  [[ "$_attempt" == 3 ]] && { warn "no valid plan after 3 attempts — stopping"; exit 1; }
+done
 ask DO_IMAGE "Image [ubuntu-24-04-x64]:"; DO_IMAGE="${DO_IMAGE:-ubuntu-24-04-x64}"
 write_env DO_REGION "$DO_REGION"
 write_env DO_SIZE "$DO_SIZE"
@@ -360,6 +390,8 @@ head -c 104857600 /dev/urandom > /var/www/html/100MB.bin
 printf 'server {\n listen 443 default_server;\n listen [::]:443 default_server;\n root /var/www/html;\n}\n' > /etc/nginx/sites-available/tcp443
 ln -sf /etc/nginx/sites-available/tcp443 /etc/nginx/sites-enabled/tcp443
 systemctl enable --now nginx
+nginx -t
+systemctl reload nginx
 printf '[Unit]\nDescription=iperf3\n[Service]\nExecStart=/usr/bin/iperf3 -s\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/iperf3.service
 systemctl daemon-reload
 systemctl enable --now iperf3
@@ -506,7 +538,7 @@ RESULT="$RUN_DIR/result.md"
   echo "# Candidate result: DigitalOcean $DO_SIZE in $DO_REGION"
   echo
   echo "> NOT Tokyo route evidence. DigitalOcean operates no Japan region."
-  echo "> This is a tooling rehearsal only. See docs/adr/0002."
+  echo "> San Francisco candidates are tracked under docs/adr/0003."
   echo
   cat "$RUN_DIR/path-state.txt"
   echo
@@ -546,7 +578,7 @@ else
   note "  set -a; . $TOKEN_FILE; set +a; . $GUARD; do_destroy_droplet $DROPLET_ID"
 fi
 printf '\n'
-note "To test another region, re-run this wizard and choose blr1 or syd1."
+note "To test another candidate, re-run this wizard and choose sfo3 or tor1."
 note "Turn the commercial VPN back on when you are finished."
 
 finish

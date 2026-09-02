@@ -1,8 +1,8 @@
 # VPN Gcore
 
-Public planning and engineering repository for a Japan VPN proof of concept.
+Public planning and engineering repository for a regional VPN proof of concept.
 
-The first milestone is to measure candidate Tokyo routes from the target mainland China network and validate one Xray-compatible deployment. Client branding and remote node management come after the network path is proven.
+The current milestone is to validate San Francisco from the target mainland China network with an Xray-compatible deployment. Tokyo remains a planned exit location. Policy-agent, custom-client, and commercial work come after the current network path is proven.
 
 ## Project workflow
 
@@ -11,7 +11,8 @@ The first milestone is to measure candidate Tokyo routes from the target mainlan
 - [`docs/adr/`](docs/adr/) records architectural decisions that are costly to reverse.
 - [`docs/benchmark-protocol.md`](docs/benchmark-protocol.md) defines the route and tunnel test method.
 - [`docs/research/tokyo-vps-candidates.md`](docs/research/tokyo-vps-candidates.md) tracks current providers and first-party test endpoints.
+- [`docs/research/digitalocean-exit-candidates.md`](docs/research/digitalocean-exit-candidates.md) ranks the current San Francisco and fallback candidates.
 - [`scripts/do-route-wizard.sh`](scripts/do-route-wizard.sh) walks one create, measure, destroy cycle against a temporary DigitalOcean exit node.
 - Public files must never contain server credentials, client UUIDs, private keys, subscription secrets, or administrative endpoints.
 
-The project is currently in discovery. Follow the [proof-of-concept parent issue](https://github.com/bagtyyarkovusov/vpn-gcore/issues/1) for progress. Deployment instructions and compatibility guarantees have not been established.
+The project is currently in discovery. [San Francisco spec #9](https://github.com/bagtyyarkovusov/vpn-gcore/issues/9) is the current design and work index; the existing [Tokyo proof-of-concept issue](https://github.com/bagtyyarkovusov/vpn-gcore/issues/1) remains open but deferred. There is no live proof node, and accepting the design does not authorize cloud provisioning. Deployment instructions and compatibility guarantees have not been established.

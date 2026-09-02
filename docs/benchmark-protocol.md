@@ -1,8 +1,8 @@
-# Tokyo route benchmark protocol
+# San Francisco route benchmark protocol
 
 ## Purpose
 
-Use this protocol to decide whether a Tokyo exit node is good enough for the private proof of concept. The primary test network is China Telecom 5G in Hangzhou. Results do not represent another carrier, access type, or city.
+Use this protocol to decide whether the `sfo2` San Francisco exit node is good enough for the private proof of concept. The primary test network is China Telecom 5G in Hangzhou. Results do not represent another carrier, access type, city, iOS version, or tunnel-client build.
 
 The first round tests a direct route. Test a relay only after the direct candidates fail and the measurements show why.
 
@@ -14,7 +14,7 @@ Keep raw results in a private working location until they have been reviewed. Pu
 
 Before renting a server, record first-party evidence for:
 
-- a Tokyo or Japan compute location;
+- a San Francisco compute location;
 - the current monthly price and any setup, traffic, or bandwidth charges;
 - a provider-operated test IP, looking glass, or test file when available;
 - the plan's traffic allowance, port speed, billing interval, and cancellation rules.
@@ -33,7 +33,7 @@ Keep these variables as stable as practical:
 - Run one off-peak session and one peak session between 20:00 and 23:00 on three separate days.
 - Run candidates in alternating order when comparing them in the same session.
 
-Mobile radio conditions can dominate a short test. At the start and end of each session, run the same control measurement against a stable nearby target. Keep the result as context rather than subtracting it from candidate measurements.
+Mobile radio conditions can dominate a short test. Run continuous controls against a stable nearby target and the candidate throughout each session. A material control-path outage, unexplained access change, or inability to sustain the benchmark makes the route session invalid rather than a pass or failure.
 
 ## Stage 1: pre-rental route screening
 
@@ -59,31 +59,33 @@ Record server CPU use during throughput tests. A saturated small VM can look lik
 
 ## Stage 3: tunnel validation
 
-Install only the minimum Xray-compatible server configuration needed for the test. Connect with v2rayNG, then record:
+Install only the minimum pinned Xray server configuration needed for VLESS with REALITY, XTLS Vision, RAW transport, and TCP/443. Connect first with Shadowrocket and repeat the compatibility checks with Hiddify, then record:
 
 1. whether the client connects and remains connected for 30 minutes;
 2. the public IP country, region, and ASN without publishing the active IP;
 3. three download and three upload throughput tests using the same method as the raw tests;
 4. latency, jitter, and packet loss through the tunnel;
 5. DNS resolver country and any DNS leak result;
-6. reconnect behavior after toggling airplane mode and after a 5G to LTE transition, when that transition can be tested safely;
+6. reconnect behavior after airplane mode, Wi-Fi and cellular transitions, screen lock and wake, app force-quit, phone restart, and an Xray service restart;
 7. server CPU and memory use during the run.
 
-Do not install a control plane or modify the Android app during this stage.
+Record the exact iOS, Shadowrocket, Hiddify, and Xray versions. Do not install a policy agent, operator authority, web panel, subscription service, or custom client during this stage.
 
-## Proposed decision gate
+## Accepted decision gate
 
-The following thresholds are a starting point for the private pilot, not accepted product requirements:
+The proof passes only when all of the following are true:
 
 - total recurring infrastructure cost is no more than USD 20 per month;
-- the observed public exit is in Japan;
-- the tunnel completes a 30-minute peak-hour run without an unexplained disconnect;
+- the observed public exit is in San Francisco, California, United States;
+- the tunnel completes one valid 30-minute peak-hour run on three separate days without an unexplained disconnect;
 - end-to-end peak-hour packet loss is at most 2 percent in each accepted session;
 - peak-hour median tunnel throughput is at least 20 Mbit/s downstream and 5 Mbit/s upstream;
 - the tunnel does not expose the access network's DNS resolver;
-- no persistent route detour makes direct Tokyo materially worse than the other tested candidates.
+- the tested client reconnects within 15 seconds after an airplane-mode or Wi-Fi/cellular transition and within 60 seconds after an Xray service restart;
+- server CPU and memory are recorded for every accepted throughput and stability run;
+- the access-network controls remain healthy enough for every accepted run to be a valid route session.
 
-If no direct candidate passes, keep the failed results and open a separate relay experiment. Do not silently loosen the thresholds after seeing the outcome.
+If `sfo2` fails, keep the failed results and diagnose whether the route, tunnel, access network, or exit node caused the failure. Test `sfo3` only through its own guarded decision. A relay remains a separate experiment. Do not silently loosen thresholds after seeing the outcome.
 
 ## Result template
 
@@ -140,13 +142,17 @@ Copy this section for each candidate. Use `unknown` when a field cannot be verif
 - Latency / jitter / packet loss:
 - DNS resolver country and leak result:
 - Airplane-mode reconnect result:
-- 5G to LTE transition result:
+- Wi-Fi / cellular transition result:
+- Screen-lock / wake result:
+- App force-quit / phone restart result:
+- Xray restart result:
+- Client and iOS versions:
 - Server CPU and memory during test:
 
 ## Assessment
 
 - Recurring budget gate: pass | fail | unknown
-- Japan exit gate: pass | fail | unknown
+- San Francisco exit gate: pass | fail | unknown
 - Stability gate: pass | fail | unknown
 - Packet-loss gate: pass | fail | unknown
 - Throughput gate: pass | fail | unknown
