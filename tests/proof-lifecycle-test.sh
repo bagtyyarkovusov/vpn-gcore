@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/proof-lifecycle.sh"
+
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  exit 1
+}
+
+assert_file_contains() {
+  local file="$1" pattern="$2"
+  grep -Eq "$pattern" "$file" || fail "$file did not contain $pattern"
+}
+
+assert_json_field() {
+  local file="$1" expr="$2" expected="$3"
+  local actual
+  actual=$(python3 -c '
+import json, sys
+expr = sys.argv[1]
+with open(sys.argv[2], encoding="utf-8") as fh:
+    data = json.load(fh)
+print(eval(expr, {"__builtins__": {"len": len}}, {"data": data}))
+' "$expr" "$file")
+  [[ "$actual" == "$expected" ]] || fail "$expr expected $expected got $actual"
+}
+
+test_capture_preserves_failed_probe_status() {
+  local run="$TMPDIR/capture"
+  mkdir -p "$run"
+
+  set +e
+  proof_capture "$run" "failing-probe" bash -c 'echo before; exit 7'
+  local status=$?
+  set -e
+
+  [[ "$status" -eq 7 ]] || fail "proof_capture returned $status instead of failed command status 7"
+  assert_file_contains "$run/failing-probe.txt" '^exit_code=7$'
+  assert_file_contains "$run/session.log" '^exit_code=7$'
+}
+
+test_manifest_records_versions_checksums_statuses_and_redacts_ip() {
+  local run="$TMPDIR/manifest"
+  mkdir -p "$run"
+  proof_init_state "$run" sfo2 s-2vcpu-2gb ubuntu-24-04-x64 5 7
+  proof_record_created "$run" 555 vpn-gcore-exp-proof sfo2 s-2vcpu-2gb
+  proof_record_outcome "$run" "node-ping-100" 0
+  proof_record_outcome "$run" "node-tcp443-connect" 28
+  printf 'active node 203.0.113.14 secret-free\n' >"$run/node-tcp443-connect.txt"
+  proof_write_manifest "$run" "invalid: access control failed"
+
+  assert_json_field "$run/manifest.json" "data['region']" "sfo2"
+  assert_json_field "$run/manifest.json" "data['size']" "s-2vcpu-2gb"
+  assert_json_field "$run/manifest.json" "data['max_budget_usd']" "5"
+  assert_json_field "$run/manifest.json" "data['max_lifecycle_days']" "7"
+  assert_json_field "$run/manifest.json" "data['invalid_session_reason']" "invalid: access control failed"
+  assert_json_field "$run/manifest.json" "data['outcomes']['node-tcp443-connect']['exit_code']" "28"
+  assert_json_field "$run/manifest.json" "data['outcomes']['node-tcp443-connect']['passed']" "False"
+  assert_json_field "$run/manifest.json" "len(data['captures'])" "1"
+  assert_json_field "$run/manifest.json" "data['resource_identity']" "redacted"
+  ! grep -q '203\.0\.113\.14' "$run/manifest.json" || fail "manifest leaked an active IP address"
+  ! grep -q '555' "$run/manifest.json" || fail "manifest leaked a Droplet ID"
+  ! grep -q 'vpn-gcore-exp-proof' "$run/manifest.json" || fail "manifest leaked a Droplet name"
+}
+
+test_baseline_mismatch_fails_closed() {
+  local protected="$TMPDIR/protected.txt" live="$TMPDIR/live.json"
+  printf '100\n101\n' >"$protected"
+  printf '{"droplets":[{"id":100},{"id":999}]}\n' >"$live"
+
+  set +e
+  proof_verify_protected_baseline "$protected" "$live" >"$TMPDIR/baseline.out" 2>&1
+  local status=$?
+  set -e
+
+  [[ "$status" -ne 0 ]] || fail "baseline mismatch passed"
+  assert_file_contains "$TMPDIR/baseline.out" 'unknown Droplet 999'
+}
+
+test_recovery_refuses_wrong_ownership() {
+  local run="$TMPDIR/recovery"
+  mkdir -p "$run"
+  proof_init_state "$run" sfo2 s-2vcpu-2gb ubuntu-24-04-x64 5 7
+  proof_record_created "$run" 555 vpn-gcore-exp-proof sfo2 s-2vcpu-2gb
+  printf '10\n11\n' >"$run/protected-ids.txt"
+  printf '{"droplet":{"id":555,"name":"vpn-gcore-exp-proof","region":{"slug":"sfo2"},"size_slug":"s-2vcpu-2gb","tags":["other-tag"]}}\n' >"$run/live-droplet.json"
+
+  set +e
+  proof_recovery_plan "$run/state.json" "$run/protected-ids.txt" "$run/live-droplet.json" >"$TMPDIR/recovery.out" 2>&1
+  local status=$?
+  set -e
+
+  [[ "$status" -ne 0 ]] || fail "wrong ownership recovery passed"
+  assert_file_contains "$TMPDIR/recovery.out" 'missing required ownership tag'
+}
+
+test_dry_run_blocks_cloud_mutation() {
+  set +e
+  PROOF_DRY_RUN=1 proof_require_mutation_authorized "create droplet" >"$TMPDIR/dryrun.out" 2>&1
+  local status=$?
+  set -e
+
+  [[ "$status" -eq 2 ]] || fail "dry run returned $status instead of 2"
+  assert_file_contains "$TMPDIR/dryrun.out" '^DRY RUN: create droplet$'
+}
+
+test_env_cleanup_removes_only_lifecycle_keys() {
+  local env="$TMPDIR/run.env"
+  {
+    printf 'DO_REGION=sfo2\n'
+    printf 'DO_DROPLET_ID=555\n'
+    printf 'DO_DROPLET_IP=203.0.113.14\n'
+    printf 'DO_RUN_DIR=/private/tmp/example\n'
+  } >"$env"
+
+  proof_forget_env_keys "$env" DO_DROPLET_ID DO_DROPLET_IP DO_RUN_DIR
+
+  assert_file_contains "$env" '^DO_REGION=sfo2$'
+  ! grep -q '^DO_DROPLET_ID=' "$env" || fail "old Droplet ID remained in env"
+  ! grep -q '^DO_DROPLET_IP=' "$env" || fail "old Droplet IP remained in env"
+  ! grep -q '^DO_RUN_DIR=' "$env" || fail "old run directory remained in env"
+}
+
+test_lifecycle_bounds_fail_when_state_is_stale() {
+  local run="$TMPDIR/stale"
+  mkdir -p "$run"
+  proof_init_state "$run" sfo2 s-2vcpu-2gb ubuntu-24-04-x64 5 7
+  python3 - "$run/state.json" <<'PY'
+import datetime as dt
+import json
+import sys
+
+path = sys.argv[1]
+data = json.load(open(path, encoding="utf-8"))
+data["created_at_utc"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=8)).replace(microsecond=0).isoformat()
+json.dump(data, open(path, "w", encoding="utf-8"), indent=2, sort_keys=True)
+PY
+
+  set +e
+  proof_enforce_lifecycle_bounds "$run/state.json" >"$TMPDIR/stale.out" 2>&1
+  local status=$?
+  set -e
+
+  [[ "$status" -ne 0 ]] || fail "stale lifecycle passed bounds check"
+  assert_file_contains "$TMPDIR/stale.out" 'older than 7 days'
+}
+
+test_destroy_boundary_refuses_protected_target() {
+  local protected="$TMPDIR/destroy-protected.txt" live="$TMPDIR/destroy-live.json"
+  printf '555\n777\n' >"$protected"
+  printf '{"droplets":[{"id":555},{"id":777}]}\n' >"$live"
+
+  set +e
+  proof_verify_destroy_boundary "$protected" "$live" 555 >"$TMPDIR/destroy.out" 2>&1
+  local status=$?
+  set -e
+
+  [[ "$status" -ne 0 ]] || fail "protected target destroy boundary passed"
+  assert_file_contains "$TMPDIR/destroy.out" 'protected baseline'
+}
+
+main() {
+  test_capture_preserves_failed_probe_status
+  test_manifest_records_versions_checksums_statuses_and_redacts_ip
+  test_baseline_mismatch_fails_closed
+  test_recovery_refuses_wrong_ownership
+  test_dry_run_blocks_cloud_mutation
+  test_env_cleanup_removes_only_lifecycle_keys
+  test_lifecycle_bounds_fail_when_state_is_stale
+  test_destroy_boundary_refuses_protected_target
+  printf 'ok - proof lifecycle tests\n'
+}
+
+main "$@"

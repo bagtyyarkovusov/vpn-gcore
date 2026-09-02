@@ -193,6 +193,7 @@ TOTAL_STAGES=6
 # the repository. Private, mode 600, same convention as do-route-wizard.sh.
 ENV_FILE="/private/tmp/vpn-gcore-access-baseline.env"
 RUN_DIR="/private/tmp/vpn-gcore-access-$(date +%Y%m%d-%H%M%S)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Reference figure to compare against: the aggregate iperf3 upload measured to
 # the sgp1 exit node on 2026-09-02 off-peak, run folder
@@ -204,14 +205,14 @@ umask 077
 mkdir -p "$RUN_DIR"
 touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
 
+# shellcheck source=scripts/proof-lifecycle.sh
+. "$REPO_ROOT/scripts/proof-lifecycle.sh"
+
 jqp() { local prog="$1"; shift; python3 -c "import json,sys
 $prog" "$@"; }
 
-capture() { # capture NAME COMMAND... — tee raw output into the run folder
-  local name="$1"; shift
-  printf '\n===== %s =====\n' "$name" >>"$RUN_DIR/session.log"
-  { printf '$'; printf ' %q' "$@"; printf '\n'; "$@" || true; printf '\nexit_code=%s\n' "$?"; } \
-    2>&1 | tee "$RUN_DIR/${name//[^A-Za-z0-9_.-]/_}.txt" >>"$RUN_DIR/session.log" || true
+capture() {
+  proof_capture "$RUN_DIR" "$@"
 }
 
 banner "Access network baseline — how fast is this connection, really?"

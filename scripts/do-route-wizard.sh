@@ -191,14 +191,23 @@ ENV_FILE="/private/tmp/vpn-gcore-do-run.env"
 TOKEN_FILE="/private/tmp/vpn-gcore-do-session.env"
 GUARD="/private/tmp/vpn-gcore-do-guard.sh"
 SSH_KEY="/private/tmp/vpn-gcore-do-experiment-key"
-RUN_DIR="/private/tmp/vpn-gcore-do-stage2-$(date +%Y%m%d-%H%M%S)"
+EXISTING_RUN_DIR=$(grep -E '^DO_RUN_DIR=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)
+RUN_DIR="${DO_RUN_DIR:-${EXISTING_RUN_DIR:-/private/tmp/vpn-gcore-do-stage2-$(date +%Y%m%d-%H%M%S)}}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 API="https://api.digitalocean.com/v2"
 TAG="vpn-gcore-experiment"
+MAX_PROOF_BUDGET_USD=5
+MAX_PROOF_LIFECYCLE_DAYS=7
+
+# shellcheck source=scripts/proof-lifecycle.sh
+. "$REPO_ROOT/scripts/proof-lifecycle.sh"
 
 umask 077
 mkdir -p "$RUN_DIR"
 touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
+if [[ -z "$EXISTING_RUN_DIR" ]]; then
+  write_env DO_RUN_DIR "$RUN_DIR"
+fi
 
 api() { # api METHOD PATH [JSON-BODY]
   local method="$1" path="$2" body="${3:-}"
@@ -215,11 +224,15 @@ api() { # api METHOD PATH [JSON-BODY]
 jqp() { local prog="$1"; shift; python3 -c "import json,sys
 $prog" "$@"; }  # tiny json helper, no jq
 
-capture() { # capture NAME COMMAND... — tee raw output into the run folder
-  local name="$1"; shift
-  printf '\n===== %s =====\n' "$name" >>"$RUN_DIR/session.log"
-  { printf '$'; printf ' %q' "$@"; printf '\n'; "$@" || true; printf '\nexit_code=%s\n' "$?"; } \
-    2>&1 | tee "$RUN_DIR/${name//[^A-Za-z0-9_.-]/_}.txt" >>"$RUN_DIR/session.log" || true
+capture() {
+  proof_capture "$RUN_DIR" "$@"
+}
+
+MEASUREMENT_FAILED=0
+run_measurement() {
+  if ! capture "$@"; then
+    MEASUREMENT_FAILED=1
+  fi
 }
 
 banner "DigitalOcean exit-node route test — create, measure, destroy"
@@ -249,10 +262,26 @@ DROPLET_LIMIT=$(jqp 'a=json.load(sys.stdin)["account"];print(a["droplet_limit"])
 LIVE_JSON=$(api GET "/droplets?per_page=200")
 LIVE_COUNT=$(jqp 'print(len(json.load(sys.stdin)["droplets"]))' <<<"$LIVE_JSON")
 LIVE_IDS=$(jqp 'print("\n".join(str(d["id"]) for d in json.load(sys.stdin)["droplets"]))' <<<"$LIVE_JSON")
+printf '%s\n' "$PROTECTED_IDS" > "$RUN_DIR/protected-ids.txt"
+printf '%s\n' "$LIVE_JSON" > "$RUN_DIR/baseline-live-droplets.json"
 
 say "protected baseline : $PROTECTED_COUNT Droplet(s) — never touched"
 say "live on account    : $LIVE_COUNT Droplet(s)"
 say "account limit      : $DROPLET_LIMIT"
+
+EXISTING_DROPLET_ID="$(_existing DO_DROPLET_ID || true)"
+if [[ -n "$EXISTING_DROPLET_ID" ]]; then
+  warn "A previous proof lifecycle is recorded in $ENV_FILE."
+  api GET "/droplets/$EXISTING_DROPLET_ID" > "$RUN_DIR/recovery-droplet.json" || true
+  if [[ -f "$RUN_DIR/state.json" ]] \
+     && proof_recovery_plan "$RUN_DIR/state.json" "$RUN_DIR/protected-ids.txt" "$RUN_DIR/recovery-droplet.json"; then
+    warn "Stop here and finish the exact recorded lifecycle before creating another proof node."
+    note "  set -a; . $TOKEN_FILE; set +a; . $GUARD; do_destroy_droplet $EXISTING_DROPLET_ID"
+  else
+    warn "Recovery did not verify exact ownership. Reconcile manually before any mutation."
+  fi
+  exit 1
+fi
 
 if [[ "$LIVE_COUNT" != "$PROTECTED_COUNT" ]]; then
   printf '\n'
@@ -325,8 +354,10 @@ ask DO_IMAGE "Image [ubuntu-24-04-x64]:"; DO_IMAGE="${DO_IMAGE:-ubuntu-24-04-x64
 write_env DO_REGION "$DO_REGION"
 write_env DO_SIZE "$DO_SIZE"
 write_env DO_IMAGE "$DO_IMAGE"
+proof_init_state "$RUN_DIR" "$DO_REGION" "$DO_SIZE" "$DO_IMAGE" "$MAX_PROOF_BUDGET_USD" "$MAX_PROOF_LIFECYCLE_DAYS"
 printf '\n'
 note "Billing is hourly. A 4-hour cycle on s-2vcpu-2gb costs about USD 0.11."
+note "This proof lifecycle is bounded to ${MAX_PROOF_LIFECYCLE_DAYS} days and USD ${MAX_PROOF_BUDGET_USD}."
 note "A powered-off Droplet still bills. This wizard destroys, never stops."
 pause "Press Enter."
 
@@ -352,6 +383,10 @@ for k in keys:
         print(k["id"]); break
 ' "${SSH_KEY}.pub")
 if [[ -z "$KEY_ID" ]]; then
+  api GET "/droplets?per_page=200" > "$RUN_DIR/pre-key-live-droplets.json"
+  proof_verify_protected_baseline_json "$PROTECTED_IDS" "$RUN_DIR/pre-key-live-droplets.json" \
+    || { warn "baseline changed before SSH-key upload — refusing mutation"; exit 1; }
+  PROOF_CLOUD_AUTHORIZED=1 proof_require_mutation_authorized "upload experiment SSH key" || exit 1
   KEY_ID=$(api POST /account/keys "$(python3 -c '
 import json,sys
 print(json.dumps({"name":"vpn-gcore-experiment","public_key":sys.argv[1]}))' "$PUBKEY")" \
@@ -377,6 +412,13 @@ step "extras  IPv6 on, monitoring on, backups off"
 printf '\n'
 warn "This consumes the account's last free Droplet slot and starts billing."
 confirm "Create it?" || { say "Nothing created."; exit 0; }
+api GET "/droplets?per_page=200" > "$RUN_DIR/pre-create-live-droplets.json"
+proof_verify_protected_baseline_json "$PROTECTED_IDS" "$RUN_DIR/pre-create-live-droplets.json" \
+  || { warn "baseline changed before create — refusing mutation"; exit 1; }
+if ! PROOF_CLOUD_AUTHORIZED=1 proof_require_mutation_authorized "create Droplet $DROPLET_NAME in $DO_REGION"; then
+  say "Nothing created."
+  exit 0
+fi
 
 # Take the guard's tagged payload, then add the measurement server bootstrap.
 BASE_PAYLOAD=$(do_create_droplet_payload "$DROPLET_NAME" "$DO_REGION" "$DO_SIZE" "$DO_IMAGE" "$KEY_ID")
@@ -413,6 +455,7 @@ if [[ -z "$DROPLET_ID" ]]; then
   exit 1
 fi
 write_env DO_DROPLET_ID "$DROPLET_ID"
+proof_record_created "$RUN_DIR" "$DROPLET_ID" "$DROPLET_NAME" "$DO_REGION" "$DO_SIZE"
 say "Created Droplet id $DROPLET_ID. Waiting for an address and for boot…"
 
 DROPLET_IP=""
@@ -498,36 +541,56 @@ pause "Press Enter to start measuring."
 # ── Stage 6 ───────────────────────────────────────────────────────────────
 stage "Measure the raw route to the exit node"
 set -a; . "$ENV_FILE"; set +a
+MEASURE_ALLOWED=1
+if ! proof_enforce_lifecycle_bounds "$RUN_DIR/state.json"; then
+  warn "lifecycle boundary reached; skip measurement and destroy the proof node"
+  MEASUREMENT_FAILED=1
+  MEASURE_ALLOWED=0
+fi
 say "Target: the Droplet created in Stage 4. Output folder: $RUN_DIR"
 say "This takes roughly 15 minutes. Leave the handset alone."
 printf '\n'
 
-capture "control-start-ping-cloudflare" ping -c 100 1.1.1.1
-capture "node-ping-100"                 ping -c 100 "$DROPLET_IP"
-capture "node-traceroute-icmp"          traceroute -I -q 3 "$DROPLET_IP"
-capture "node-traceroute-tcp443"        traceroute -P TCP -p 443 -q 3 "$DROPLET_IP"
-capture "node-tcp443-connect"           curl -4 -sS -o /dev/null -m 20 \
-  -w 'connect=%{time_connect}s total=%{time_total}s code=%{http_code}\n' "http://$DROPLET_IP:443/"
+if [[ "$MEASURE_ALLOWED" -eq 1 ]]; then
+  run_measurement "control-start-ping-cloudflare" ping -c 100 1.1.1.1
+  run_measurement "node-ping-100"                 ping -c 100 "$DROPLET_IP"
+  run_measurement "node-traceroute-icmp"          traceroute -I -q 3 "$DROPLET_IP"
+  run_measurement "node-traceroute-tcp443"        traceroute -P TCP -p 443 -q 3 "$DROPLET_IP"
+  run_measurement "node-tcp443-connect"           curl -4 -sS -o /dev/null -m 20 \
+    -w 'connect=%{time_connect}s total=%{time_total}s code=%{http_code}\n' "http://$DROPLET_IP:443/"
+  run_measurement "node-readiness-services"       ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+    -i "$SSH_KEY" "root@$DROPLET_IP" 'set -e; systemctl is-active nginx iperf3; ss -ltnp; ip -s link show; uptime'
+  run_measurement "node-host-firewall-state"      ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+    -i "$SSH_KEY" "root@$DROPLET_IP" 'set -e; if command -v ufw >/dev/null 2>&1; then ufw status verbose; fi; nft list ruleset 2>/dev/null || iptables-save'
+  run_measurement "control-dns-state"             sh -c 'set -e; dig +short example.com; scutil --dns 2>/dev/null | sed -n "1,80p" || true'
+  if ! api GET "/firewalls?per_page=200" > "$RUN_DIR/do-firewalls-readonly.json"; then
+    warn "could not capture DigitalOcean firewall state"
+    MEASUREMENT_FAILED=1
+  fi
 
-for i in 1 2 3; do
-  capture "node-download-100mb-$i" curl -4 -L -o /dev/null -sS --max-time 300 \
-    -w 'code=%{http_code} bytes=%{size_download} time=%{time_total}s speed=%{speed_download}B/s\n' \
-    "http://$DROPLET_IP/100MB.bin"
-  sleep 10
-done
+  for i in 1 2 3; do
+    run_measurement "node-download-100mb-$i" curl -4 -L -o /dev/null -sS --max-time 300 \
+      -w 'code=%{http_code} bytes=%{size_download} time=%{time_total}s speed=%{speed_download}B/s\n' \
+      "http://$DROPLET_IP/100MB.bin"
+    sleep 10
+  done
 
-if command -v iperf3 >/dev/null 2>&1; then
-  capture "node-iperf3-down" iperf3 -c "$DROPLET_IP" -R -t 30 -P 4
-  capture "node-iperf3-up"   iperf3 -c "$DROPLET_IP"    -t 30 -P 4
-else
-  note "iperf3 missing locally — install it for the upload direction (brew install iperf3)."
+  if command -v iperf3 >/dev/null 2>&1; then
+    run_measurement "node-iperf3-down" iperf3 -c "$DROPLET_IP" -R -t 30 -P 4
+    run_measurement "node-iperf3-up"   iperf3 -c "$DROPLET_IP"    -t 30 -P 4
+  else
+    note "iperf3 missing locally — install it for the upload direction (brew install iperf3)."
+  fi
+
+  say "Now a 30-minute continuous latency run to expose bursts of loss."
+  if confirm "Run it?"; then
+    run_measurement "node-continuous-30min" ping -c 1800 "$DROPLET_IP"
+  fi
+  run_measurement "control-end-ping-cloudflare" ping -c 100 1.1.1.1
 fi
-
-say "Now a 30-minute continuous latency run to expose bursts of loss."
-if confirm "Run it?"; then
-  capture "node-continuous-30min" ping -c 1800 "$DROPLET_IP"
+if [[ "$MEASUREMENT_FAILED" -ne 0 ]]; then
+  warn "One or more probes failed. This route session is invalid until explained."
 fi
-capture "control-end-ping-cloudflare" ping -c 100 1.1.1.1
 say "Raw output written to $RUN_DIR"
 pause "Press Enter."
 
@@ -543,11 +606,17 @@ RESULT="$RUN_DIR/result.md"
   cat "$RUN_DIR/path-state.txt"
   echo
   echo "Raw captures: $RUN_DIR"
+  if [[ "$MEASUREMENT_FAILED" -ne 0 ]]; then
+    echo
+    echo "Invalid-session reason: one or more measurement commands exited non-zero."
+  fi
   echo
   sed -n '/^## Candidate$/,$p' "$REPO_ROOT/docs/benchmark-protocol.md" 2>/dev/null \
     || echo "Fill in from the result template in docs/benchmark-protocol.md."
 } > "$RESULT"
+proof_write_manifest "$RUN_DIR" "$( [[ "$MEASUREMENT_FAILED" -ne 0 ]] && printf 'one or more measurement commands exited non-zero' || true )"
 say "Pre-filled result template: $RESULT"
+say "Sanitized evidence manifest: $RUN_DIR/manifest.json"
 step "Fill in the measured values from the capture files."
 step "Keep it in /private/tmp. Sanitize before anything reaches an issue."
 warn "Never paste the Droplet address into GitHub."
@@ -562,11 +631,19 @@ say "that is on the protected baseline or missing the '$TAG' tag."
 printf '\n'
 note "You will be asked to type the Droplet name: $DROPLET_NAME"
 printf '\n'
+proof_enforce_lifecycle_bounds "$RUN_DIR/state.json" \
+  || warn "lifecycle boundary reached; destruction is the only allowed mutation."
+api GET "/droplets?per_page=200" > "$RUN_DIR/pre-destroy-live-droplets.json"
+proof_verify_destroy_boundary "$RUN_DIR/protected-ids.txt" "$RUN_DIR/pre-destroy-live-droplets.json" "$DROPLET_ID" \
+  || { warn "destroy boundary is not exact — refusing mutation"; exit 1; }
+PROOF_CLOUD_AUTHORIZED=1 proof_require_mutation_authorized "destroy Droplet $DROPLET_ID" || exit 1
 if do_destroy_droplet "$DROPLET_ID"; then
   sleep 15
   AFTER=$(api GET "/droplets?per_page=200" | jqp 'print(len(json.load(sys.stdin)["droplets"]))')
   if [[ "$AFTER" == "$PROTECTED_COUNT" ]]; then
     say "Account is back to its protected baseline of $PROTECTED_COUNT Droplet(s)."
+    proof_record_destroyed "$RUN_DIR"
+    proof_forget_env_keys "$ENV_FILE" DO_DROPLET_ID DO_DROPLET_IP DO_RUN_DIR
   else
     warn "Account shows $AFTER Droplet(s), expected $PROTECTED_COUNT. Check by hand."
   fi
@@ -582,3 +659,7 @@ note "To test another candidate, re-run this wizard and choose sfo3 or tor1."
 note "Turn the commercial VPN back on when you are finished."
 
 finish
+if [[ "$MEASUREMENT_FAILED" -ne 0 ]]; then
+  warn "Proof workflow finished cleanup, but the route session is invalid."
+  exit 1
+fi

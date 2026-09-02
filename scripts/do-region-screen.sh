@@ -219,6 +219,7 @@ REGIONS=(
 
 ENV_FILE="/private/tmp/vpn-gcore-do-screen.env"
 RUN_DIR="/private/tmp/vpn-gcore-do-screen-$(date +%Y%m%d-%H%M%S)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # What sfo2 delivered from a rented Droplet, for comparison.
 # Run folder /private/tmp/vpn-gcore-do-stage2-20260902-064513.
@@ -230,14 +231,21 @@ umask 077
 mkdir -p "$RUN_DIR"
 touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
 
+# shellcheck source=scripts/proof-lifecycle.sh
+. "$REPO_ROOT/scripts/proof-lifecycle.sh"
+
 jqp() { local prog="$1"; shift; python3 -c "import json,sys
 $prog" "$@"; }
 
 capture() {
-  local name="$1"; shift
-  printf '\n===== %s =====\n' "$name" >>"$RUN_DIR/session.log"
-  { printf '$'; printf ' %q' "$@"; printf '\n'; "$@" || true; printf '\nexit_code=%s\n' "$?"; } \
-    2>&1 | tee "$RUN_DIR/${name//[^A-Za-z0-9_.-]/_}.txt" >>"$RUN_DIR/session.log" || true
+  proof_capture "$RUN_DIR" "$@"
+}
+
+SCREEN_FAILED=0
+screen_capture() {
+  if ! capture "$@"; then
+    SCREEN_FAILED=1
+  fi
 }
 
 banner "DigitalOcean region screen — measure before you rent"
@@ -330,7 +338,7 @@ say "Same control target and ping count as the exit-node runs, so the numbers"
 say "compare directly across sessions."
 printf '\n'
 
-capture "control-start-ping-cloudflare" ping -c 100 -i 0.3 1.1.1.1
+screen_capture "control-start-ping-cloudflare" ping -c 100 -i 0.3 1.1.1.1
 printf '\n'
 
 for entry in "${REGIONS[@]}"; do
@@ -344,15 +352,18 @@ for entry in "${REGIONS[@]}"; do
   fi
   say "$slug ($label) → $ip"
   echo "$slug $ip $host" >> "$RUN_DIR/targets.txt"
-  capture "$slug-ping-100"        ping -c 100 -i 0.3 "$ip"
-  capture "$slug-traceroute-icmp" traceroute -I -q 1 -m 20 -w 2 "$ip"
-  capture "$slug-tcp443-connect"  curl -4 -sS -o /dev/null -m 20 \
+  screen_capture "$slug-ping-100"        ping -c 100 -i 0.3 "$ip"
+  screen_capture "$slug-traceroute-icmp" traceroute -I -q 1 -m 20 -w 2 "$ip"
+  screen_capture "$slug-tcp443-connect"  curl -4 -sS -o /dev/null -m 20 \
     -w 'connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s code=%{http_code}\n' \
     "https://$host/"
 done
 
 printf '\n'
-capture "control-end-ping-cloudflare" ping -c 100 -i 0.3 1.1.1.1
+screen_capture "control-end-ping-cloudflare" ping -c 100 -i 0.3 1.1.1.1
+if [[ "$SCREEN_FAILED" -ne 0 ]]; then
+  warn "One or more screen probes failed; review exit_code lines before ranking."
+fi
 printf '\n'
 pause "Press Enter for the ranking."
 

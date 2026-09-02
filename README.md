@@ -10,6 +10,7 @@ The current milestone is to validate San Francisco from the target mainland Chin
 - [`CONTEXT.md`](CONTEXT.md) defines the project's agreed domain vocabulary.
 - [`docs/adr/`](docs/adr/) records architectural decisions that are costly to reverse.
 - [`docs/benchmark-protocol.md`](docs/benchmark-protocol.md) defines the route and tunnel test method.
+- [`docs/guarded-proof-workflow.md`](docs/guarded-proof-workflow.md) defines the human authorization, evidence, and recovery boundary for the temporary proof node.
 - [`docs/research/tokyo-vps-candidates.md`](docs/research/tokyo-vps-candidates.md) tracks current providers and first-party test endpoints.
 - [`docs/research/digitalocean-exit-candidates.md`](docs/research/digitalocean-exit-candidates.md) ranks the current San Francisco and fallback candidates.
 - [`scripts/do-route-wizard.sh`](scripts/do-route-wizard.sh) walks one create, measure, destroy cycle against a temporary DigitalOcean exit node.
