@@ -307,6 +307,7 @@ set +a
   exit 1
 }
 DO_PROTECTED_IDS="$PROTECTED_IDS_FILE"
+# shellcheck disable=SC2034  # consumed by do-guard.sh while it is sourced below
 DO_EXPERIMENT_TAG="$TAG"
 # shellcheck source=scripts/do-guard.sh
 . "$GUARD"
@@ -513,6 +514,13 @@ apt-get install -y ca-certificates curl iperf3 openssl ufw
 bash -c "\$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "\$XRAY_VERSION"
 install -d -m 700 /root/vpn-gcore-proof
 
+cat > /etc/sysctl.d/99-vpn-gcore-bbr.conf <<SYSCTL
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+SYSCTL
+sysctl --system
+tc qdisc replace dev eth0 root fq || true
+
 # Deny by default. Only the three ports this proof actually needs are reachable,
 # and iperf3's is useless while its unit is stopped (see below).
 ufw --force reset
@@ -528,8 +536,8 @@ ufw --force enable
 set +x
 VLESS_UUID="\$(cat /proc/sys/kernel/random/uuid)"
 KEYPAIR="\$(/usr/local/bin/xray x25519)"
-REALITY_PRIVATE_KEY="\$(printf '%s\n' "\$KEYPAIR" | awk '/Private key:/ {print \$3}')"
-REALITY_PUBLIC_KEY="\$(printf '%s\n' "\$KEYPAIR" | awk '/Public key:/ {print \$3}')"
+REALITY_PRIVATE_KEY="\$(printf '%s\n' "\$KEYPAIR" | awk -F': *' '/Private[[:space:]]*[Kk]ey:/ {print \$2}')"
+REALITY_PUBLIC_KEY="\$(printf '%s\n' "\$KEYPAIR" | awk -F': *' '/Public[[:space:]]*[Kk]ey:/ {print \$2}')"
 SHORT_ID="\$(openssl rand -hex 8)"
 SERVER_NAME="www.apple.com"
 TARGET="www.apple.com:443"
@@ -538,6 +546,13 @@ cat > /usr/local/etc/xray/config.json <<XRAY_CONFIG
 {
   "log": {
     "loglevel": "warning"
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "bufferSize": 4096
+      }
+    }
   },
   "inbounds": [
     {
@@ -582,7 +597,8 @@ cat > /usr/local/etc/xray/config.json <<XRAY_CONFIG
   ]
 }
 XRAY_CONFIG
-chmod 600 /usr/local/etc/xray/config.json
+chown nobody:root /usr/local/etc/xray/config.json
+chmod 640 /usr/local/etc/xray/config.json
 cat > /root/vpn-gcore-proof/shadowrocket-vless-reality.uri <<PROFILE
 vless://\$VLESS_UUID@\$PUBLIC_IPV4:443?encryption=none&security=reality&sni=\$SERVER_NAME&fp=chrome&pbk=\$REALITY_PUBLIC_KEY&sid=\$SHORT_ID&type=tcp&flow=xtls-rprx-vision#vpn-gcore-\$XRAY_VERSION-proof
 PROFILE
@@ -745,11 +761,11 @@ host = sys.argv[1]
 with socket.create_connection((host, 443), timeout=20):
     print("tcp/443 connected")
 PY
-  run_measurement "node-readiness-services"       ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+  run_measurement "node-readiness-services"       ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
     -i "$SSH_KEY" "root@$DROPLET_IP" 'set -e; systemctl is-active xray; command -v iperf3; /usr/local/bin/xray -version; /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json; ss -ltnp; ip -s link show; free -m; uptime'
-  run_measurement "node-host-firewall-state"      ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+  run_measurement "node-host-firewall-state"      ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
     -i "$SSH_KEY" "root@$DROPLET_IP" 'set -e; if command -v ufw >/dev/null 2>&1; then ufw status verbose; fi; nft list ruleset 2>/dev/null || iptables-save'
-  run_measurement "fetch-shadowrocket-profile"    scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+  run_measurement "fetch-shadowrocket-profile"    scp -B -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
     -i "$SSH_KEY" "root@$DROPLET_IP:/root/vpn-gcore-proof/shadowrocket-vless-reality.uri" "$RUN_DIR/shadowrocket-vless-reality.uri"
   run_measurement "control-dns-state"             sh -c 'set -e; dig +short example.com; scutil --dns 2>/dev/null | sed -n "1,80p" || true'
   if ! api GET "/firewalls?per_page=200" > "$RUN_DIR/do-firewalls-readonly.json"; then
@@ -761,25 +777,25 @@ PY
     # The server is off by default and only runs for these six transfers, so the
     # window in which an open iperf3 port could burn transfer allowance is
     # minutes rather than the whole lifecycle.
-    run_measurement "node-iperf3-server-start" ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+    run_measurement "node-iperf3-server-start" ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
       -i "$SSH_KEY" "root@$DROPLET_IP" 'systemctl start iperf3; systemctl is-active iperf3'
     for i in 1 2 3; do
-      run_measurement "node-resource-before-iperf3-down-$i" ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      run_measurement "node-resource-before-iperf3-down-$i" ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
         -i "$SSH_KEY" "root@$DROPLET_IP" 'date -u; systemctl is-active xray iperf3; free -m; top -b -n1 | sed -n "1,20p"; ip -s link show'
       run_measurement "node-iperf3-down-$i" iperf3 -c "$DROPLET_IP" -R -t 30 -P 4
-      run_measurement "node-resource-after-iperf3-down-$i" ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      run_measurement "node-resource-after-iperf3-down-$i" ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
         -i "$SSH_KEY" "root@$DROPLET_IP" 'date -u; free -m; top -b -n1 | sed -n "1,20p"; ip -s link show'
       sleep 10
     done
     for i in 1 2 3; do
-      run_measurement "node-resource-before-iperf3-up-$i" ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      run_measurement "node-resource-before-iperf3-up-$i" ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
         -i "$SSH_KEY" "root@$DROPLET_IP" 'date -u; systemctl is-active xray iperf3; free -m; top -b -n1 | sed -n "1,20p"; ip -s link show'
       run_measurement "node-iperf3-up-$i" iperf3 -c "$DROPLET_IP" -t 30 -P 4
-      run_measurement "node-resource-after-iperf3-up-$i" ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      run_measurement "node-resource-after-iperf3-up-$i" ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
         -i "$SSH_KEY" "root@$DROPLET_IP" 'date -u; free -m; top -b -n1 | sed -n "1,20p"; ip -s link show'
       sleep 10
     done
-    run_measurement "node-iperf3-server-stop" ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+    run_measurement "node-iperf3-server-stop" ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
       -i "$SSH_KEY" "root@$DROPLET_IP" 'systemctl stop iperf3; systemctl is-active iperf3 || true'
   else
     note "iperf3 missing locally — install it for the upload direction (brew install iperf3)."

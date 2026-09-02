@@ -197,6 +197,40 @@ test_wizard_passes_pinned_xray_version_to_state() {
     || fail "wizard does not pass XRAY_VERSION into proof_init_state"
 }
 
+test_wizard_bootstrap_enables_bbr_and_xray_buffers() {
+  local wizard="$ROOT/scripts/do-route-wizard.sh"
+  assert_file_contains "$wizard" 'net.core.default_qdisc=fq'
+  assert_file_contains "$wizard" 'net.ipv4.tcp_congestion_control=bbr'
+  assert_file_contains "$wizard" 'tc qdisc replace dev eth0 root fq'
+  assert_file_contains "$wizard" '"policy":'
+  assert_file_contains "$wizard" '"bufferSize": 4096'
+}
+
+test_wizard_x25519_parser_accepts_xray_26_key_labels() {
+  local wizard="$ROOT/scripts/do-route-wizard.sh"
+  assert_file_contains "$wizard" 'Private\[\[:space:\]\]\*\[Kk\]ey:'
+  assert_file_contains "$wizard" 'Public\[\[:space:\]\]\*\[Kk\]ey:'
+  ! grep -q "awk '/Private key:/ {print" "$wizard" \
+    || fail "wizard still only parses old Private key label"
+}
+
+test_wizard_xray_config_is_readable_by_service_user() {
+  local wizard="$ROOT/scripts/do-route-wizard.sh"
+  assert_file_contains "$wizard" 'chown nobody:root /usr/local/etc/xray/config.json'
+  assert_file_contains "$wizard" 'chmod 640 /usr/local/etc/xray/config.json'
+  ! grep -q 'chmod 600 /usr/local/etc/xray/config.json' "$wizard" \
+    || fail "wizard still makes xray config unreadable by the nobody service user"
+}
+
+test_wizard_remote_commands_do_not_consume_prompt_stdin() {
+  local wizard="$ROOT/scripts/do-route-wizard.sh"
+  ! grep -q 'run_measurement .*ssh -o ' "$wizard" \
+    || fail "wizard has an ssh measurement without -n"
+  ! grep -q 'run_measurement .*scp -o ' "$wizard" \
+    || fail "wizard has an scp measurement without batch mode"
+  assert_file_contains "$wizard" 'run_measurement "fetch-shadowrocket-profile"[[:space:]]+scp -B '
+}
+
 test_pinned_xray_version_reaches_state_and_manifest() {
   local run="$TMPDIR/xray-version"
   mkdir -p "$run"
@@ -491,6 +525,10 @@ main() {
   test_dry_run_blocks_cloud_mutation
   test_env_cleanup_removes_only_lifecycle_keys
   test_wizard_passes_pinned_xray_version_to_state
+  test_wizard_bootstrap_enables_bbr_and_xray_buffers
+  test_wizard_x25519_parser_accepts_xray_26_key_labels
+  test_wizard_xray_config_is_readable_by_service_user
+  test_wizard_remote_commands_do_not_consume_prompt_stdin
   test_pinned_xray_version_reaches_state_and_manifest
   test_manifest_omits_xray_version_when_unpinned
   test_destroy_boundary_accepts_exact_owned_target
